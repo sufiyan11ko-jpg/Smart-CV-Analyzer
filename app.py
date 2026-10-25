@@ -272,45 +272,36 @@ ATS_ACTION_VERBS = [
 
 # ----------------------------------------------------------------------------
 # TEXT EXTRACTION
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 def read_cv(file_name: str, file_bytes: bytes) -> str:
     name = file_name.lower()
 
     if name.endswith(".pdf"):
         import pdfplumber
+
+        pages = []
         with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-            pages = []
             for page in pdf.pages:
-                try:
-                    pages.append(page.extract_text() or "")
-                except Exception:
-                    pages.append("")
-            return "
-".join(pages)
+                page_text = page.extract_text() or ""
+                pages.append(page_text)
+
+        return chr(10).join(pages)
 
     if name.endswith(".docx"):
         import docx
+
         document = docx.Document(io.BytesIO(file_bytes))
-        parts = [p.text for p in document.paragraphs]
+        parts = []
+
+        for paragraph in document.paragraphs:
+            parts.append(paragraph.text)
 
         for table in document.tables:
             for row in table.rows:
-                parts.append(" | ".join(cell.text for cell in row.cells))
+                cells = [cell.text for cell in row.cells]
+                parts.append(" | ".join(cells))
 
-        return "
-".join(parts)
-
-    return file_bytes.decode("utf-8", errors="ignore")
-
-if name.endswith(".docx"):
-        import docx
-        document = docx.Document(io.BytesIO(file_bytes))
-        parts = [p.text for p in document.paragraphs]
-        for table in document.tables:
-            for row in table.rows:
-                parts.append(" | ".join(cell.text for cell in row.cells))
-        return "
-".join(parts)
+        return chr(10).join(parts)
 
     return file_bytes.decode("utf-8", errors="ignore")
 
