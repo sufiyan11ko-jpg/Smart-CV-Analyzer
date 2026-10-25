@@ -476,8 +476,7 @@ def estimate_experience_years(text: str, experience_lines: list) -> float:
     best = max(years) if years and max(years) < 40 else 0.0
 
     span = 0.0
-    joined = "
-".join(experience_lines)
+       joined = chr(10).join(experience_lines)
 
     for start, end in re.findall(
         r"((?:19|20)d{2})s*[-–to]+s*((?:19|20)d{2}|present|current)",
