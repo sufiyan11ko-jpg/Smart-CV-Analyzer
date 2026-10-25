@@ -1,8 +1,8 @@
 streamlit
 pdfplumber
 python-docx
-scikit-learn
 pandas
 numpy
-PyPDF2
-fpdf
+plotly
+reportlab
+scikit-learn
