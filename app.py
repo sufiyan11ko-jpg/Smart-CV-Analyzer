@@ -1,6 +1,7 @@
 """
 CV Analyzer Pro - Streamlit Mini Project
-Run: streamlit run app.py
+Install: pip install streamlit pandas plotly pdfplumber python-docx reportlab
+Run:     streamlit run app.py
 """
 
 import io
@@ -27,7 +28,8 @@ st.set_page_config(
 # THEME
 # ----------------------------------------------------------------------------
 if "theme" not in st.session_state:
-    st.session_state.theme = "Dark"
+    st.session_state["theme"] = "Dark"
+
 
 def get_css(theme: str) -> str:
     if theme == "Dark":
@@ -36,14 +38,12 @@ def get_css(theme: str) -> str:
         border = "#2b3245"
         text = "#e5e7eb"
         sub = "#9ca3af"
-        accent = "#7c3aed"
     else:
         bg = "#f8fafc"
         card = "#ffffff"
         border = "#e2e8f0"
         text = "#0f172a"
         sub = "#475569"
-        accent = "#4f46e5"
 
     return f"""
 <style>
@@ -59,7 +59,7 @@ h1, h2, h3, h4, h5, h6, p, span, label, div {{ color: {text}; }}
 .hero p {{ margin: 8px 0 0; color: rgba(255,255,255,.92); font-size: 1.02rem; }}
 .card {{
     background: {card}; border: 1px solid {border}; border-radius: 16px;
-    padding: 18px 20px; box-shadow: 0 4px 18px rgba(0,0,0,.08);
+    padding: 18px 20px; box-shadow: 0 4px 18px rgba(0,0,0,.08); margin-bottom: 8px;
 }}
 .kpi {{
     background: {card}; border: 1px solid {border}; border-radius: 16px;
@@ -92,6 +92,19 @@ h1, h2, h3, h4, h5, h6, p, span, label, div {{ color: {text}; }}
 </style>
 """
 
+
+def chart_font_color() -> str:
+    return "#e5e7eb" if st.session_state.get("theme") == "Dark" else "#0f172a"
+
+
+def show_chart(fig):
+    """Works on old and new Streamlit versions."""
+    try:
+        st.plotly_chart(fig, width="stretch")
+    except Exception:
+        st.plotly_chart(fig, use_container_width=True)
+
+
 # ----------------------------------------------------------------------------
 # KNOWLEDGE BASE
 # ----------------------------------------------------------------------------
@@ -109,7 +122,7 @@ SKILLS_DB = {
         "machine learning", "deep learning", "nlp", "computer vision", "pandas", "numpy",
         "scikit-learn", "tensorflow", "keras", "pytorch", "opencv", "power bi", "tableau",
         "data analysis", "data visualization", "matplotlib", "seaborn", "excel",
-        "statistics", "generative ai", "llm", "langchain", "data science", "sql"
+        "statistics", "generative ai", "llm", "langchain", "data science"
     ],
     "Database": [
         "sql", "mysql", "postgresql", "mongodb", "sqlite", "oracle", "firebase", "redis", "nosql"
@@ -130,6 +143,25 @@ SKILLS_DB = {
 }
 
 AMBIGUOUS = {"c", "r", "go"}
+
+LABEL_OVERRIDES = {
+    "node.js": "Node.js", "nodejs": "Node.js", "next.js": "Next.js", "ci/cd": "CI/CD",
+    "ui/ux": "UI/UX", "power bi": "Power BI", "rest api": "REST API",
+    "scikit-learn": "Scikit-learn", "c++": "C++", "c#": "C#", "ios": "iOS",
+    "nosql": "NoSQL", "mysql": "MySQL", "postgresql": "PostgreSQL", "mongodb": "MongoDB",
+    "javascript": "JavaScript", "typescript": "TypeScript", "tensorflow": "TensorFlow",
+    "pytorch": "PyTorch", "opencv": "OpenCV", "fastapi": "FastAPI", "github": "GitHub",
+    "wordpress": "WordPress", "jquery": "jQuery", "langchain": "LangChain",
+    "sqlite": "SQLite", "spring boot": "Spring Boot", "react native": "React Native",
+}
+
+
+def pretty(skill: str) -> str:
+    low = skill.lower()
+    if low in LABEL_OVERRIDES:
+        return LABEL_OVERRIDES[low]
+    return skill.upper() if len(skill) <= 3 else skill.title()
+
 
 SECTION_ALIASES = {
     "education": [
@@ -270,48 +302,51 @@ ATS_ACTION_VERBS = [
     "achieved", "collaborated", "integrated", "maintained", "researched"
 ]
 
+METRIC_RE = re.compile(r"\d+\s?%|\d+\+|\$\s?\d+|₹\s?\d+")
+
 # ----------------------------------------------------------------------------
 # TEXT EXTRACTION
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 def read_cv(file_name: str, file_bytes: bytes) -> str:
     name = file_name.lower()
 
     if name.endswith(".pdf"):
-        import pdfplumber
+        try:
+            import pdfplumber
+        except ImportError as exc:
+            raise RuntimeError("pdfplumber install karo: pip install pdfplumber") from exc
 
-        pages = []
         with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+            pages = []
             for page in pdf.pages:
-                page_text = page.extract_text() or ""
-                pages.append(page_text)
-
-        return chr(10).join(pages)
+                try:
+                    pages.append(page.extract_text() or "")
+                except Exception:
+                    pages.append("")
+            return "\n".join(pages)
 
     if name.endswith(".docx"):
-        import docx
+        try:
+            import docx
+        except ImportError as exc:
+            raise RuntimeError("python-docx install karo: pip install python-docx") from exc
 
         document = docx.Document(io.BytesIO(file_bytes))
-        parts = []
-
-        for paragraph in document.paragraphs:
-            parts.append(paragraph.text)
-
+        parts = [p.text for p in document.paragraphs]
         for table in document.tables:
             for row in table.rows:
-                cells = [cell.text for cell in row.cells]
-                parts.append(" | ".join(cells))
-
-        return chr(10).join(parts)
+                parts.append(" | ".join(cell.text for cell in row.cells))
+        return "\n".join(parts)
 
     return file_bytes.decode("utf-8", errors="ignore")
 
 
-EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+.[A-Za-z]{2,}")
+EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 PHONE_RE = re.compile(
-    r"(?:+?d{1,3}[s-]?)?(?:(?d{3,5})?[s.-]?)?d{3,5}[s.-]?d{4,5}"
+    r"(?:\+?\d{1,3}[\s-]?)?(?:\(?\d{3,5}\)?[\s.-]?)?\d{3,5}[\s.-]?\d{4,5}"
 )
-LINKEDIN_RE = re.compile(r"(?:https?://)?(?:www.)?linkedin.com/in/[w-%]+", re.I)
-GITHUB_RE = re.compile(r"(?:https?://)?(?:www.)?github.com/[w-]+", re.I)
+LINKEDIN_RE = re.compile(r"(?:https?://)?(?:www\.)?linkedin\.com/in/[\w\-%]+", re.I)
+GITHUB_RE = re.compile(r"(?:https?://)?(?:www\.)?github\.com/[\w\-]+", re.I)
 
 
 def extract_email(text: str) -> str:
@@ -321,9 +356,9 @@ def extract_email(text: str) -> str:
 
 def extract_phone(text: str) -> str:
     for match in PHONE_RE.finditer(text):
-        digits = re.sub(r"D", "", match.group(0))
+        digits = re.sub(r"\D", "", match.group(0))
         if 10 <= len(digits) <= 13:
-            if not re.fullmatch(r"(19|20)d{2}(19|20)d{2}", digits):
+            if not re.fullmatch(r"(19|20)\d{2}(19|20)\d{2}", digits):
                 return match.group(0).strip()
     return "Not found"
 
@@ -334,9 +369,9 @@ def extract_name(text: str, email: str) -> str:
         "contact", "address", "email", "phone", "mobile", "github", "linkedin"
     )
 
-    for line in [line.strip() for line in text.splitlines() if line.strip()][:15]:
+    for line in [ln.strip() for ln in text.splitlines() if ln.strip()][:15]:
         low = line.lower()
-        if "@" in line or any(word in low for word in skip_words) or re.search(r"d", line):
+        if "@" in line or any(word in low for word in skip_words) or re.search(r"\d", line):
             continue
 
         words = re.sub(r"[^A-Za-z .'-]", " ", line).split()
@@ -346,7 +381,7 @@ def extract_name(text: str, email: str) -> str:
             )
 
     if email != "Not found":
-        guess = re.sub(r"[d._-]+", " ", email.split("@")[0]).title().strip()
+        guess = re.sub(r"[\d._-]+", " ", email.split("@")[0]).title().strip()
         if guess:
             return guess
 
@@ -383,7 +418,7 @@ def split_sections(text: str) -> dict:
 def find_pattern(text: str, pattern: str):
     return re.search(
         r"(?<![A-Za-z0-9+#.])" + re.escape(pattern) + r"(?![A-Za-z0-9+#])",
-        text,
+        text or "",
         re.I,
     )
 
@@ -395,7 +430,7 @@ def extract_skills(text: str, skills_section: str) -> dict:
         for skill in skills:
             hay = skills_section if skill in AMBIGUOUS else text
             if hay and find_pattern(hay, skill):
-                label = skill.upper() if len(skill) <= 3 else skill.title()
+                label = pretty(skill)
                 found.setdefault(category, [])
                 if label not in found[category]:
                     found[category].append(label)
@@ -404,8 +439,8 @@ def extract_skills(text: str, skills_section: str) -> dict:
 
 
 DEGREE_RE = re.compile(
-    r"\b(b.?s?tech|m.?s?tech|b.?s?e.?|m.?s?e.?|bca|mca|bba|mba|b.?s?sc|"
-    r"m.?s?sc|b.?s?com|m.?s?com|b.?s?a.?|m.?s?a.?|ph.?d|diploma|bachelor|"
+    r"\b(b\.?\s?tech|m\.?\s?tech|b\.\s?e\.?|m\.\s?e\.?|bca|mca|bba|mba|b\.?\s?sc|"
+    r"m\.?\s?sc|b\.?\s?com|m\.?\s?com|b\.\s?a\.?|m\.\s?a\.?|ph\.?\s?d|diploma|bachelor|"
     r"master|doctorate|12th|10th|hsc|ssc|intermediate|higher secondary|secondary|"
     r"cbse|icse|polytechnic)\b",
     re.I,
@@ -471,42 +506,43 @@ def extract_links(text: str):
 def estimate_experience_years(text: str, experience_lines: list) -> float:
     years = [
         float(value)
-        for value in re.findall(r"(d+(?:.d+)?)+?s*(?:years?|yrs?)", text, re.I)
+        for value in re.findall(r"(\d+(?:\.\d+)?)\+?\s*(?:years?|yrs?)", text, re.I)
     ]
     best = max(years) if years and max(years) < 40 else 0.0
 
     span = 0.0
-       joined = chr(10).join(experience_lines)
+    joined = "\n".join(experience_lines)
+    current_year = datetime.now().year
 
     for start, end in re.findall(
-        r"((?:19|20)d{2})s*[-–to]+s*((?:19|20)d{2}|present|current)",
+        r"((?:19|20)\d{2})\s*(?:-|–|—|to)\s*((?:19|20)\d{2}|present|current)",
         joined,
         re.I,
     ):
-        end_year = 2026 if end.lower() in ("present", "current") else int(end)
+        end_year = current_year if end.lower() in ("present", "current") else int(end)
         span += max(0, end_year - int(start))
 
-    return round(max(best, span), 1)
+    return round(min(max(best, span), 40.0), 1)
 
 
 # ----------------------------------------------------------------------------
-# SCORING
+# SCORING  (maximum total = 100)
 # ----------------------------------------------------------------------------
 def calculate_score(data: dict):
     breakdown = {}
     tips = []
 
-    # Contact - 15
+    # Contact - 10
     contact = 0
-    contact += 4 if data["name"] != "Not found" else 0
-    contact += 4 if data["email"] != "Not found" else 0
-    contact += 4 if data["phone"] != "Not found" else 0
-    contact += 3 if data["linkedin"] or data["github"] else 0
-    breakdown["Contact Info"] = (contact, 15)
+    contact += 3 if data["name"] != "Not found" else 0
+    contact += 3 if data["email"] != "Not found" else 0
+    contact += 2 if data["phone"] != "Not found" else 0
+    contact += 2 if data["linkedin"] or data["github"] else 0
+    breakdown["Contact Info"] = (contact, 10)
 
     if not (data["linkedin"] or data["github"]):
         tips.append("Add LinkedIn and GitHub links at the top of your CV.")
-    if contact < 12:
+    if contact < 8:
         tips.append("Keep name, email and phone clearly visible in the header.")
 
     # Skills - 25
@@ -532,9 +568,9 @@ def calculate_score(data: dict):
     if not data["skills"].get("Soft Skills"):
         tips.append("Add soft skills such as communication, teamwork and leadership.")
 
-    # Education - 15
-    education_score = min(15, 6 + len(data["education"]) * 3) if data["education"] else 0
-    breakdown["Education"] = (education_score, 15)
+    # Education - 10
+    education_score = min(10, 4 + len(data["education"]) * 2) if data["education"] else 0
+    breakdown["Education"] = (education_score, 10)
 
     if not data["education"]:
         tips.append("Add an Education section with degree, institution and year.")
@@ -560,7 +596,7 @@ def calculate_score(data: dict):
 
     # Certifications - 5
     cert_score = min(5, len(data["certifications"]) * 1.5) if data["certifications"] else 0
-    breakdown["Certifications"] = (cert_score, 5)
+    breakdown["Certifications"] = (round(cert_score, 1), 5)
 
     if not data["certifications"]:
         tips.append("Add relevant certifications or online courses.")
@@ -575,7 +611,7 @@ def calculate_score(data: dict):
     else:
         formatting = 3
 
-    metrics = len(re.findall(r"d+%|d++|$d+|₹d+", data["text"]))
+    metrics = METRIC_RE.search(data["text"])
     formatting = min(15, formatting + (2 if metrics else 0))
 
     action_verbs = sum(
@@ -595,6 +631,7 @@ def calculate_score(data: dict):
         tips.append("Your CV is long. Keep it concise, ideally 1–2 pages.")
 
     total = round(sum(value for value, _ in breakdown.values()))
+    total = max(0, min(100, total))
     return total, breakdown, tips
 
 
@@ -635,15 +672,18 @@ def match_jobs(all_skills: list) -> list:
 # JOB DESCRIPTION MATCHER
 # ----------------------------------------------------------------------------
 def extract_jd_skills(jd_text: str) -> list:
-    jd_lower = jd_text.lower()
     found = []
 
     for category, skills in SKILLS_DB.items():
         if category == "Soft Skills":
             continue
         for skill in skills:
-            if find_pattern(jd_lower, skill) and skill not in found:
-                found.append(skill)
+            if skill in AMBIGUOUS:
+                continue  # single letters cause too many false positives in free text
+            if find_pattern(jd_text, skill):
+                canonical = "node.js" if skill == "nodejs" else skill
+                if canonical not in found:
+                    found.append(canonical)
 
     return found
 
@@ -660,7 +700,12 @@ def match_job_description(cv_text: str, jd_text: str) -> dict:
             "priority": [],
         }
 
-    matched = [skill for skill in jd_skills if find_pattern(cv_text, skill)]
+    def in_cv(skill: str) -> bool:
+        if skill == "node.js":
+            return bool(find_pattern(cv_text, "node.js") or find_pattern(cv_text, "nodejs"))
+        return bool(find_pattern(cv_text, skill))
+
+    matched = [skill for skill in jd_skills if in_cv(skill)]
     missing = [skill for skill in jd_skills if skill not in matched]
     match_percent = round(100 * len(matched) / len(jd_skills))
 
@@ -668,8 +713,8 @@ def match_job_description(cv_text: str, jd_text: str) -> dict:
         missing,
         key=lambda skill: (
             0 if skill in ("python", "sql", "machine learning", "javascript", "aws") else 1,
-            skill
-        )
+            skill,
+        ),
     )
 
     return {
@@ -692,49 +737,42 @@ def ats_checks(data: dict) -> list:
     checks.append({
         "Check": "Contact details",
         "Status": "Pass" if data["email"] != "Not found" and data["phone"] != "Not found" else "Warning",
-        "Detail": "Email and phone should be clearly present."
+        "Detail": "Email and phone should be clearly present.",
     })
-
     checks.append({
         "Check": "LinkedIn / GitHub",
         "Status": "Pass" if data["linkedin"] or data["github"] else "Warning",
-        "Detail": "Add professional profile links."
+        "Detail": "Add professional profile links.",
     })
-
     checks.append({
         "Check": "Skills section",
         "Status": "Pass" if data["skills"] else "Warning",
-        "Detail": "Add a clearly labelled Technical Skills section."
+        "Detail": "Add a clearly labelled Technical Skills section.",
     })
-
     checks.append({
         "Check": "Education section",
         "Status": "Pass" if data["education"] else "Warning",
-        "Detail": "Add degree, institution and year."
+        "Detail": "Add degree, institution and year.",
     })
-
     checks.append({
         "Check": "Projects section",
         "Status": "Pass" if len(data["projects"]) >= 2 else "Warning",
-        "Detail": "Add at least 2–3 strong projects."
+        "Detail": "Add at least 2–3 strong projects.",
     })
-
     checks.append({
         "Check": "Measurable achievements",
-        "Status": "Pass" if re.search(r"d+%|d++|$d+|₹d+", text) else "Warning",
-        "Detail": "Use numbers, percentages or business impact."
+        "Status": "Pass" if METRIC_RE.search(text) else "Warning",
+        "Detail": "Use numbers, percentages or business impact.",
     })
-
     checks.append({
         "Check": "Action verbs",
         "Status": "Pass" if any(find_pattern(text, verb) for verb in ATS_ACTION_VERBS) else "Warning",
-        "Detail": "Use verbs such as developed, built, optimized and deployed."
+        "Detail": "Use verbs such as developed, built, optimized and deployed.",
     })
-
     checks.append({
         "Check": "CV length",
         "Status": "Pass" if 250 <= words <= 900 else "Warning",
-        "Detail": f"Current word count: {words}. Ideal range: 250–900 words."
+        "Detail": f"Current word count: {words}. Ideal range: 250–900 words.",
     })
 
     return checks
@@ -750,7 +788,7 @@ def suggest_projects(skills_by_category: dict) -> list:
     ordered = sorted(
         skills_by_category.items(),
         key=lambda item: len(item[1]),
-        reverse=True
+        reverse=True,
     )
 
     for category, _ in ordered:
@@ -768,6 +806,11 @@ def suggest_projects(skills_by_category: dict) -> list:
 # ----------------------------------------------------------------------------
 # PDF REPORT
 # ----------------------------------------------------------------------------
+def pdf_safe(value) -> str:
+    """Drop characters the built-in PDF fonts cannot draw (emoji, etc.)."""
+    return str(value).encode("cp1252", "ignore").decode("cp1252")
+
+
 def build_pdf(data: dict, total: int, breakdown: dict, tips: list,
               jobs: list, ideas: list, jd_result: dict = None) -> bytes:
     from reportlab.lib import colors
@@ -787,73 +830,70 @@ def build_pdf(data: dict, total: int, breakdown: dict, tips: list,
     )
 
     styles = getSampleStyleSheet()
-    h1 = ParagraphStyle("h1", parent=styles["Heading1"], textColor=colors.HexColor("#4f46e5"))
+    h1 = ParagraphStyle("h1x", parent=styles["Heading1"], textColor=colors.HexColor("#4f46e5"))
     h2 = ParagraphStyle(
-        "h2",
+        "h2x",
         parent=styles["Heading2"],
         textColor=colors.HexColor("#4f46e5"),
         spaceBefore=12,
     )
-    body = styles["BodyText"]
+    body = ParagraphStyle("bodyx", parent=styles["BodyText"], wordWrap="CJK")
+    cell_style = ParagraphStyle("cellx", parent=body, fontSize=9, leading=11)
+    head_style = ParagraphStyle(
+        "headx", parent=cell_style, textColor=colors.white, fontName="Helvetica-Bold"
+    )
 
-    def paragraph(value, style=body):
-        return Paragraph(escape(str(value)), style)
+    def para(value, style=body):
+        return Paragraph(escape(pdf_safe(value)), style)
 
     def make_table(rows, widths, header=True):
         table = Table(rows, colWidths=widths, repeatRows=1 if header else 0)
         style = [
             ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#c7c7d9")),
             ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f3f4fb")]),
+            ("ROWBACKGROUNDS", (0, 1 if header else 0), (-1, -1),
+             [colors.white, colors.HexColor("#f3f4fb")]),
         ]
-
         if header:
-            style += [
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4f46e5")),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-            ]
-
+            style.append(("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4f46e5")))
         table.setStyle(TableStyle(style))
         return table
 
     story = [
         Paragraph("CV Analysis Report", h1),
-        paragraph(f"Generated on: {datetime.now().strftime('%d %b %Y')}"),
+        para(f"Generated on: {datetime.now().strftime('%d %b %Y')}"),
         Spacer(1, 8),
-    ]
-
-    story.append(
         make_table(
             [
-                ["Name", data["name"]],
-                ["Email", data["email"]],
-                ["Phone", data["phone"]],
-                ["LinkedIn", data["linkedin"] or "-"],
-                ["GitHub", data["github"] or "-"],
+                [para("Name", cell_style), para(data["name"], cell_style)],
+                [para("Email", cell_style), para(data["email"], cell_style)],
+                [para("Phone", cell_style), para(data["phone"], cell_style)],
+                [para("LinkedIn", cell_style), para(data["linkedin"] or "-", cell_style)],
+                [para("GitHub", cell_style), para(data["github"] or "-", cell_style)],
             ],
             [3.5 * cm, 13 * cm],
             header=False,
-        )
-    )
+        ),
+    ]
 
     grade_label, _ = grade(total)
+    score_rows = [[para("Category", head_style), para("Score", head_style), para("Max", head_style)]]
+    for key, (value, maximum) in breakdown.items():
+        score_rows.append([para(key, cell_style), para(value, cell_style), para(maximum, cell_style)])
+
     story += [
         Paragraph("Overall CV Score", h2),
-        paragraph(f"{total} / 100 — {grade_label}"),
+        para(f"{total} / 100 - {grade_label.strip()}"),
         Spacer(1, 6),
-        make_table(
-            [["Category", "Score", "Max"]]
-            + [[key, value, maximum] for key, (value, maximum) in breakdown.items()],
-            [9 * cm, 3 * cm, 3 * cm],
-        ),
+        make_table(score_rows, [9 * cm, 3 * cm, 3 * cm]),
     ]
 
     story.append(Paragraph("Skills", h2))
     if data["skills"]:
         for category, items in data["skills"].items():
-            story.append(paragraph(f"{category}: {', '.join(items)}"))
+            story.append(para(f"{category}: {', '.join(items)}"))
     else:
-        story.append(paragraph("No skills detected."))
+        story.append(para("No skills detected."))
 
     for title, key in [
         ("Education", "education"),
@@ -863,37 +903,31 @@ def build_pdf(data: dict, total: int, breakdown: dict, tips: list,
     ]:
         story.append(Paragraph(title, h2))
         for line in data[key] or ["Not found"]:
-            story.append(paragraph("• " + line))
+            story.append(para("• " + line))
 
     story.append(Paragraph("Best Matching Job Roles", h2))
-    story.append(
-        make_table(
-            [["Role", "Match", "Companies"]]
-            + [
-                [
-                    Paragraph(escape(job["Role"]), body),
-                    f"{job['Match %']}%",
-                    Paragraph(escape(", ".join(job["Companies"][:6])), body),
-                ]
-                for job in jobs[:6]
-            ],
-            [5 * cm, 2 * cm, 9.5 * cm],
-        )
-    )
+    job_rows = [[para("Role", head_style), para("Match", head_style), para("Companies", head_style)]]
+    for job in jobs[:6]:
+        job_rows.append([
+            para(job["Role"], cell_style),
+            para(f"{job['Match %']}%", cell_style),
+            para(", ".join(job["Companies"][:6]), cell_style),
+        ])
+    story.append(make_table(job_rows, [5 * cm, 2 * cm, 9.5 * cm]))
 
-    if jd_result and jd_result["jd_skills"]:
+    if jd_result and jd_result.get("jd_skills"):
         story.append(Paragraph("Job Description Match", h2))
-        story.append(paragraph(f"JD Match Score: {jd_result['match_percent']}%"))
-        story.append(paragraph("Matched skills: " + ", ".join(jd_result["matched"])))
-        story.append(paragraph("Missing skills: " + ", ".join(jd_result["missing"])))
+        story.append(para(f"JD Match Score: {jd_result['match_percent']}%"))
+        story.append(para("Matched skills: " + (", ".join(pretty(s) for s in jd_result["matched"]) or "-")))
+        story.append(para("Missing skills: " + (", ".join(pretty(s) for s in jd_result["missing"]) or "-")))
 
     story.append(Paragraph("Suggested Project Topics", h2))
     for category, idea in ideas:
-        story.append(paragraph(f"• [{category}] {idea}"))
+        story.append(para(f"• [{category}] {idea}"))
 
     story.append(Paragraph("Improvement Tips", h2))
     for tip in tips or ["Great CV! Keep it updated."]:
-        story.append(paragraph("• " + tip))
+        story.append(para("• " + tip))
 
     document.build(story)
     return buffer.getvalue()
@@ -919,8 +953,7 @@ def analyze(file_name: str, file_bytes: bytes):
         "phone": phone,
         "linkedin": linkedin,
         "github": github,
-        "skills": extract_skills(text, "
-".join(sections["skills"])),
+        "skills": extract_skills(text, "\n".join(sections["skills"])),
         "education": extract_education(text, sections["education"]),
         "experience": experience,
         "experience_years": estimate_experience_years(text, experience),
@@ -928,9 +961,12 @@ def analyze(file_name: str, file_bytes: bytes):
         "certifications": extract_certifications(text, sections["certifications"]),
     }
 
-    data["all_skills"] = [
-        skill for items in data["skills"].values() for skill in items
-    ]
+    all_skills = []
+    for items in data["skills"].values():
+        for skill in items:
+            if skill not in all_skills:
+                all_skills.append(skill)
+    data["all_skills"] = all_skills
 
     total, breakdown, tips = calculate_score(data)
     jobs = match_jobs(data["all_skills"])
@@ -942,19 +978,9 @@ def analyze(file_name: str, file_bytes: bytes):
 # ----------------------------------------------------------------------------
 # UI
 # ----------------------------------------------------------------------------
-st.markdown(get_css(st.session_state.theme), unsafe_allow_html=True)
-
 with st.sidebar:
     st.header("⚙️ Settings")
-
-    st.session_state.theme = st.radio(
-        "Theme",
-        ["Dark", "Light"],
-        horizontal=True,
-        key="theme_selector",
-    )
-
-    st.markdown(get_css(st.session_state.theme), unsafe_allow_html=True)
+    st.radio("Theme", ["Dark", "Light"], horizontal=True, key="theme")
 
     st.divider()
     st.header("📤 Upload CV")
@@ -962,29 +988,22 @@ with st.sidebar:
         "Upload your CV",
         type=["pdf", "docx", "txt"],
     )
-
     st.caption("Tip: text-based PDF works best. Scanned PDFs need OCR.")
 
     st.divider()
     st.markdown(
-        "**Features**
-"
-        "- Premium dashboard
-"
-        "- Advanced CV parsing
-"
-        "- Editable extracted details
-"
-        "- Job Description Matcher
-"
-        "- ATS keyword checks
-"
-        "- Job roles and companies
-"
-        "- Project topic suggestions
-"
+        "**Features**\n"
+        "- Premium dashboard\n"
+        "- Advanced CV parsing\n"
+        "- Editable extracted details\n"
+        "- Job Description Matcher\n"
+        "- ATS keyword checks\n"
+        "- Job roles and companies\n"
+        "- Project topic suggestions\n"
         "- PDF report"
     )
+
+st.markdown(get_css(st.session_state["theme"]), unsafe_allow_html=True)
 
 st.markdown(
     """
@@ -1000,12 +1019,11 @@ if not uploaded_file:
     st.info("👈 Sidebar se apna CV upload karo — PDF, DOCX ya TXT.")
     st.stop()
 
+file_bytes = uploaded_file.getvalue()
+
 try:
     with st.spinner("Analyzing your CV..."):
-        data, total, breakdown, tips, jobs, ideas = analyze(
-            uploaded_file.name,
-            uploaded_file.getvalue(),
-        )
+        data, total, breakdown, tips, jobs, ideas = analyze(uploaded_file.name, file_bytes)
 except Exception as error:
     st.error(f"CV read nahi ho paya: {error}")
     st.stop()
@@ -1014,24 +1032,36 @@ if len(data["text"].strip()) < 50:
     st.warning("CV se text extract nahi hua. Ye scanned image PDF ho sakti hai.")
     st.stop()
 
-# Initialize editable values
-if "editable" not in st.session_state or st.session_state.get("last_file") != uploaded_file.name:
-    st.session_state.editable = {
+# ---- editable values: reset whenever a different file is uploaded ----------
+ED_KEYS = ["name", "email", "phone", "linkedin", "github",
+           "education", "experience", "projects", "certifications"]
+
+file_sig = f"{uploaded_file.name}:{len(file_bytes)}"
+if st.session_state.get("file_sig") != file_sig:
+    initial = {
         "name": data["name"],
         "email": data["email"],
         "phone": data["phone"],
         "linkedin": data["linkedin"] or "",
         "github": data["github"] or "",
-        "education": "
-".join(data["education"]),
-        "experience": "
-".join(data["experience"]),
-        "projects": "
-".join(data["projects"]),
-        "certifications": "
-".join(data["certifications"]),
+        "education": "\n".join(data["education"]),
+        "experience": "\n".join(data["experience"]),
+        "projects": "\n".join(data["projects"]),
+        "certifications": "\n".join(data["certifications"]),
     }
-    st.session_state.last_file = uploaded_file.name
+    for key in ED_KEYS:
+        st.session_state["ed_" + key] = initial[key]
+    st.session_state.pop("jd_result", None)
+    st.session_state["file_sig"] = file_sig
+
+
+def ed_lines(key: str) -> list:
+    return [
+        line.strip()
+        for line in str(st.session_state.get("ed_" + key, "")).splitlines()
+        if line.strip()
+    ]
+
 
 label, color = grade(total)
 
@@ -1056,21 +1086,18 @@ with tab1:
             f'<div class="value">{total}/100</div></div>',
             unsafe_allow_html=True,
         )
-
     with col2:
         st.markdown(
             f'<div class="kpi"><div class="label">Skills Found</div>'
             f'<div class="value">{len(data["all_skills"])}</div></div>',
             unsafe_allow_html=True,
         )
-
     with col3:
         st.markdown(
             f'<div class="kpi"><div class="label">Projects</div>'
             f'<div class="value">{len(data["projects"])}</div></div>',
             unsafe_allow_html=True,
         )
-
     with col4:
         st.markdown(
             f'<div class="kpi"><div class="label">Experience</div>'
@@ -1102,15 +1129,14 @@ with tab1:
             height=340,
             margin=dict(t=70, b=10, l=20, r=20),
             paper_bgcolor="rgba(0,0,0,0)",
-            font_color="#e5e7eb" if st.session_state.theme == "Dark" else "#0f172a",
+            font_color=chart_font_color(),
         )
-        st.plotly_chart(gauge, use_container_width=True)
+        show_chart(gauge)
 
     with right:
         categories = list(breakdown.keys())
         percentages = [
-            round(100 * value / maximum)
-            for value, maximum in breakdown.values()
+            round(100 * value / maximum) for value, maximum in breakdown.values()
         ]
 
         radar = go.Figure(
@@ -1127,9 +1153,9 @@ with tab1:
             margin=dict(t=40, b=20, l=50, r=50),
             showlegend=False,
             paper_bgcolor="rgba(0,0,0,0)",
-            font_color="#e5e7eb" if st.session_state.theme == "Dark" else "#0f172a",
+            font_color=chart_font_color(),
         )
-        st.plotly_chart(radar, use_container_width=True)
+        show_chart(radar)
 
     chart_left, chart_right = st.columns(2)
 
@@ -1149,9 +1175,11 @@ with tab1:
             pie.update_layout(
                 height=380,
                 paper_bgcolor="rgba(0,0,0,0)",
-                font_color="#e5e7eb" if st.session_state.theme == "Dark" else "#0f172a",
+                font_color=chart_font_color(),
             )
-            st.plotly_chart(pie, use_container_width=True)
+            show_chart(pie)
+        else:
+            st.info("Skills chart ke liye koi skill detect nahi hui.")
 
     with chart_right:
         job_df = pd.DataFrame(jobs[:8])[["Role", "Match %"]].sort_values("Match %")
@@ -1166,9 +1194,9 @@ with tab1:
         bar.update_layout(
             height=380,
             paper_bgcolor="rgba(0,0,0,0)",
-            font_color="#e5e7eb" if st.session_state.theme == "Dark" else "#0f172a",
+            font_color=chart_font_color(),
         )
-        st.plotly_chart(bar, use_container_width=True)
+        show_chart(bar)
 
 # ----------------------------------------------------------------------------
 # EXTRACTED INFO
@@ -1178,70 +1206,32 @@ with tab2:
     st.caption("Agar koi detail galat detect hui ho to yahan correct kar sakte ho.")
 
     edit_col1, edit_col2, edit_col3 = st.columns(3)
-
     with edit_col1:
-        st.session_state.editable["name"] = st.text_input(
-            "Name",
-            value=st.session_state.editable["name"],
-        )
-
+        st.text_input("Name", key="ed_name")
     with edit_col2:
-        st.session_state.editable["email"] = st.text_input(
-            "Email",
-            value=st.session_state.editable["email"],
-        )
-
+        st.text_input("Email", key="ed_email")
     with edit_col3:
-        st.session_state.editable["phone"] = st.text_input(
-            "Phone",
-            value=st.session_state.editable["phone"],
-        )
+        st.text_input("Phone", key="ed_phone")
 
     edit_col4, edit_col5 = st.columns(2)
-
     with edit_col4:
-        st.session_state.editable["linkedin"] = st.text_input(
-            "LinkedIn URL",
-            value=st.session_state.editable["linkedin"],
-        )
-
+        st.text_input("LinkedIn URL", key="ed_linkedin")
     with edit_col5:
-        st.session_state.editable["github"] = st.text_input(
-            "GitHub URL",
-            value=st.session_state.editable["github"],
-        )
+        st.text_input("GitHub URL", key="ed_github")
 
     st.markdown('<div class="section-title">🎓 Education</div>', unsafe_allow_html=True)
-    st.session_state.editable["education"] = st.text_area(
-        "Education",
-        value=st.session_state.editable["education"],
-        height=130,
-    )
+    st.text_area("Education", key="ed_education", height=130)
 
     edit_col6, edit_col7 = st.columns(2)
-
     with edit_col6:
         st.markdown('<div class="section-title">💼 Experience</div>', unsafe_allow_html=True)
-        st.session_state.editable["experience"] = st.text_area(
-            "Experience",
-            value=st.session_state.editable["experience"],
-            height=180,
-        )
-
+        st.text_area("Experience", key="ed_experience", height=180)
     with edit_col7:
         st.markdown('<div class="section-title">🚀 Projects</div>', unsafe_allow_html=True)
-        st.session_state.editable["projects"] = st.text_area(
-            "Projects",
-            value=st.session_state.editable["projects"],
-            height=180,
-        )
+        st.text_area("Projects", key="ed_projects", height=180)
 
     st.markdown('<div class="section-title">📜 Certifications</div>', unsafe_allow_html=True)
-    st.session_state.editable["certifications"] = st.text_area(
-        "Certifications",
-        value=st.session_state.editable["certifications"],
-        height=130,
-    )
+    st.text_area("Certifications", key="ed_certifications", height=130)
 
     st.divider()
     st.subheader("🧠 Detected Skills")
@@ -1266,7 +1256,7 @@ with tab3:
 
     for category, (value, maximum) in breakdown.items():
         st.write(f"**{category}** — {value}/{maximum}")
-        st.progress(min(1.0, value / maximum))
+        st.progress(max(0.0, min(1.0, float(value) / maximum)))
 
     score_df = pd.DataFrame({
         "Category": list(breakdown.keys()),
@@ -1279,7 +1269,7 @@ with tab3:
         x=score_df["Category"],
         y=score_df["Max"],
         name="Maximum",
-        marker_color="#e5e7eb",
+        marker_color="#9ca3af",
     )
     score_chart.add_bar(
         x=score_df["Category"],
@@ -1292,17 +1282,14 @@ with tab3:
         title="Score Breakdown",
         height=420,
         paper_bgcolor="rgba(0,0,0,0)",
-        font_color="#e5e7eb" if st.session_state.theme == "Dark" else "#0f172a",
+        font_color=chart_font_color(),
     )
-    st.plotly_chart(score_chart, use_container_width=True)
+    show_chart(score_chart)
 
     st.divider()
     st.subheader("🤖 ATS-style Checks")
 
-    checks = ats_checks(data)
-    check_df = pd.DataFrame(checks)
-
-    for _, row in check_df.iterrows():
+    for row in ats_checks(data):
         if row["Status"] == "Pass":
             badge = '<span class="chip ok">PASS</span>'
         else:
@@ -1325,19 +1312,19 @@ with tab3:
 with tab4:
     st.subheader("💼 Best Matching Roles & Hiring Companies")
 
-    for job in jobs[:8]:
+    for index, job in enumerate(jobs[:8]):
         with st.expander(
             f"{job['Role']} — {job['Match %']}% match",
-            expanded=job is jobs[0],
+            expanded=(index == 0),
         ):
-            st.progress(job["Match %"] / 100)
+            st.progress(max(0.0, min(1.0, job["Match %"] / 100)))
             st.markdown("**Companies:** " + ", ".join(job["Companies"]))
 
             st.markdown("**Matched skills:**")
             if job["Matched"]:
                 st.markdown(
                     "".join(
-                        f'<span class="chip ok">{escape(skill.title())}</span>'
+                        f'<span class="chip ok">{escape(pretty(skill))}</span>'
                         for skill in job["Matched"]
                     ),
                     unsafe_allow_html=True,
@@ -1349,7 +1336,7 @@ with tab4:
             if job["Missing"]:
                 st.markdown(
                     "".join(
-                        f'<span class="chip miss">{escape(skill.title())}</span>'
+                        f'<span class="chip miss">{escape(pretty(skill))}</span>'
                         for skill in job["Missing"]
                     ),
                     unsafe_allow_html=True,
@@ -1368,14 +1355,14 @@ with tab5:
         "Paste Job Description",
         height=280,
         placeholder="Paste the full job description here...",
+        key="jd_text",
     )
 
     if st.button("🔍 Match CV with Job Description", type="primary"):
         if not jd_text.strip():
             st.warning("Pehle job description paste karo.")
         else:
-            jd_result = match_job_description(data["text"], jd_text)
-            st.session_state.jd_result = jd_result
+            st.session_state["jd_result"] = match_job_description(data["text"], jd_text)
 
     jd_result = st.session_state.get("jd_result")
 
@@ -1391,14 +1378,12 @@ with tab5:
                     f'<div class="value">{jd_result["match_percent"]}%</div></div>',
                     unsafe_allow_html=True,
                 )
-
             with score_col2:
                 st.markdown(
                     f'<div class="kpi"><div class="label">Matched Skills</div>'
                     f'<div class="value">{len(jd_result["matched"])}</div></div>',
                     unsafe_allow_html=True,
                 )
-
             with score_col3:
                 st.markdown(
                     f'<div class="kpi"><div class="label">Missing Skills</div>'
@@ -1406,13 +1391,13 @@ with tab5:
                     unsafe_allow_html=True,
                 )
 
-            st.progress(jd_result["match_percent"] / 100)
+            st.progress(max(0.0, min(1.0, jd_result["match_percent"] / 100)))
 
             st.markdown('<div class="section-title">✅ Matched Skills</div>', unsafe_allow_html=True)
             if jd_result["matched"]:
                 st.markdown(
                     "".join(
-                        f'<span class="chip ok">{escape(skill.title())}</span>'
+                        f'<span class="chip ok">{escape(pretty(skill))}</span>'
                         for skill in jd_result["matched"]
                     ),
                     unsafe_allow_html=True,
@@ -1420,12 +1405,14 @@ with tab5:
             else:
                 st.write("—")
 
-            st.markdown('<div class="section-title">⚠️ Missing Skills — Priority Order</div>',
-                        unsafe_allow_html=True)
+            st.markdown(
+                '<div class="section-title">⚠️ Missing Skills — Priority Order</div>',
+                unsafe_allow_html=True,
+            )
             if jd_result["priority"]:
-                for index, skill in enumerate(jd_result["priority"], start=1):
+                for number, skill in enumerate(jd_result["priority"], start=1):
                     st.markdown(
-                        f'<div class="card">{index}. <b>{escape(skill.title())}</b>'
+                        f'<div class="card">{number}. <b>{escape(pretty(skill))}</b>'
                         f' <span class="chip miss">Learn / Add</span></div>',
                         unsafe_allow_html=True,
                     )
@@ -1445,31 +1432,15 @@ with tab6:
     st.subheader("📥 Download Report")
 
     editable_data = dict(data)
-    editable_data["name"] = st.session_state.editable["name"] or data["name"]
-    editable_data["email"] = st.session_state.editable["email"] or data["email"]
-    editable_data["phone"] = st.session_state.editable["phone"] or data["phone"]
-    editable_data["linkedin"] = st.session_state.editable["linkedin"] or None
-    editable_data["github"] = st.session_state.editable["github"] or None
-    editable_data["education"] = [
-        line.strip()
-        for line in st.session_state.editable["education"].splitlines()
-        if line.strip()
-    ]
-    editable_data["experience"] = [
-        line.strip()
-        for line in st.session_state.editable["experience"].splitlines()
-        if line.strip()
-    ]
-    editable_data["projects"] = [
-        line.strip()
-        for line in st.session_state.editable["projects"].splitlines()
-        if line.strip()
-    ]
-    editable_data["certifications"] = [
-        line.strip()
-        for line in st.session_state.editable["certifications"].splitlines()
-        if line.strip()
-    ]
+    editable_data["name"] = st.session_state.get("ed_name") or data["name"]
+    editable_data["email"] = st.session_state.get("ed_email") or data["email"]
+    editable_data["phone"] = st.session_state.get("ed_phone") or data["phone"]
+    editable_data["linkedin"] = st.session_state.get("ed_linkedin") or None
+    editable_data["github"] = st.session_state.get("ed_github") or None
+    editable_data["education"] = ed_lines("education")
+    editable_data["experience"] = ed_lines("experience")
+    editable_data["projects"] = ed_lines("projects")
+    editable_data["certifications"] = ed_lines("certifications")
 
     try:
         pdf_bytes = build_pdf(
@@ -1482,7 +1453,7 @@ with tab6:
             st.session_state.get("jd_result"),
         )
 
-        safe_name = re.sub(r"[^A-Za-z0-9]", "_", editable_data["name"])
+        safe_name = re.sub(r"[^A-Za-z0-9]+", "_", str(editable_data["name"])).strip("_") or "CV"
         st.download_button(
             "⬇️ Download PDF Report",
             data=pdf_bytes,
