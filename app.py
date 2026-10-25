@@ -307,6 +307,107 @@ METRIC_RE = re.compile(r"\d+\s?%|\d+\+|\$\s?\d+|₹\s?\d+")
 # ----------------------------------------------------------------------------
 # TEXT EXTRACTION
 # ----------------------------------------------------------------------------
+IMAGE_EXTS = (
+    ".png", ".jpg", ".jpeg", ".jfif", ".webp", ".bmp",
+    ".tif", ".tiff", ".gif", ".heic", ".heif",
+)
+MAX_OCR_PAGES = 15
+MAX_OCR_FRAMES = 8
+
+
+def _get_tesseract():
+    """Import pytesseract and auto-detect the Tesseract install location."""
+    try:
+        import pytesseract
+    except ImportError as exc:
+        raise RuntimeError(
+            "OCR library missing hai. Terminal me chalao: pip install pytesseract pillow"
+        ) from exc
+
+    import os
+    import shutil
+
+    if shutil.which("tesseract") is None:
+        for path in (
+            r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+            r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+            "/opt/homebrew/bin/tesseract",
+            "/usr/local/bin/tesseract",
+            "/usr/bin/tesseract",
+        ):
+            if os.path.exists(path):
+                pytesseract.pytesseract.tesseract_cmd = path
+                break
+    return pytesseract
+
+
+def _ocr_language(pytesseract) -> str:
+    try:
+        langs = set(pytesseract.get_languages(config=""))
+    except Exception:
+        return "eng"
+    return "eng+hin" if {"eng", "hin"} <= langs else "eng"
+
+
+def _prepare_image(img):
+    """Normalise any image: orientation, transparency, grayscale, contrast, size."""
+    from PIL import Image, ImageOps
+
+    try:
+        img = ImageOps.exif_transpose(img)
+    except Exception:
+        pass
+
+    if img.mode in ("RGBA", "LA", "P"):
+        rgba = img.convert("RGBA")
+        background = Image.new("RGB", rgba.size, "white")
+        background.paste(rgba, mask=rgba.split()[-1])
+        img = background
+
+    img = ImageOps.autocontrast(img.convert("L"))
+
+    longest = max(img.size)
+    if longest < 2000:
+        scale = 2000 / longest
+        img = img.resize((int(img.width * scale), int(img.height * scale)), Image.LANCZOS)
+    elif longest > 5000:
+        scale = 5000 / longest
+        img = img.resize((int(img.width * scale), int(img.height * scale)), Image.LANCZOS)
+    return img
+
+
+def ocr_image(img) -> str:
+    """OCR one PIL image. Raises RuntimeError with a clear message if OCR is not set up."""
+    pytesseract = _get_tesseract()
+
+    try:
+        prepared = _prepare_image(img)
+
+        # fix sideways / upside-down scans
+        try:
+            osd = pytesseract.image_to_osd(prepared, config="--psm 0")
+            match = re.search(r"Rotate:\s*(\d+)", osd)
+            if match and int(match.group(1)) % 360:
+                prepared = prepared.rotate(-int(match.group(1)), expand=True, fillcolor=255)
+        except Exception:
+            pass
+
+        lang = _ocr_language(pytesseract)
+        best = ""
+        for psm in (3, 6, 4):  # try several layout modes, keep the richest result
+            text = pytesseract.image_to_string(prepared, lang=lang, config=f"--psm {psm}")
+            if len(text.strip()) > len(best.strip()):
+                best = text
+            if len(best.strip()) >= 200:
+                break
+        return best
+    except pytesseract.TesseractNotFoundError as exc:
+        raise RuntimeError(
+            "Tesseract OCR software install nahi hai. Windows: UB-Mannheim installer, "
+            "Linux: sudo apt install tesseract-ocr, Mac: brew install tesseract"
+        ) from exc
+
+
 def read_cv(file_name: str, file_bytes: bytes) -> str:
     name = file_name.lower()
 
@@ -316,14 +417,30 @@ def read_cv(file_name: str, file_bytes: bytes) -> str:
         except ImportError as exc:
             raise RuntimeError("pdfplumber install karo: pip install pdfplumber") from exc
 
+        ocr_error = None
         with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
             pages = []
-            for page in pdf.pages:
+            for index, page in enumerate(pdf.pages):
                 try:
-                    pages.append(page.extract_text() or "")
+                    page_text = page.extract_text() or ""
                 except Exception:
-                    pages.append("")
-            return "\n".join(pages)
+                    page_text = ""
+
+                # scanned / image-only page -> OCR it
+                if len(page_text.strip()) < 30 and index < MAX_OCR_PAGES:
+                    try:
+                        page_text = ocr_image(page.to_image(resolution=200).original)
+                    except RuntimeError as exc:
+                        ocr_error = str(exc)
+                    except Exception:
+                        pass
+                pages.append(page_text)
+
+            text = "\n".join(pages)
+
+        if len(text.strip()) < 50 and ocr_error:
+            raise RuntimeError(ocr_error)
+        return text
 
     if name.endswith(".docx"):
         try:
@@ -337,6 +454,32 @@ def read_cv(file_name: str, file_bytes: bytes) -> str:
             for row in table.rows:
                 parts.append(" | ".join(cell.text for cell in row.cells))
         return "\n".join(parts)
+
+    if name.endswith(IMAGE_EXTS):
+        try:
+            from PIL import Image, ImageSequence
+        except ImportError as exc:
+            raise RuntimeError("Pillow install karo: pip install pillow") from exc
+
+        if name.endswith((".heic", ".heif")):
+            try:
+                import pillow_heif
+                pillow_heif.register_heif_opener()
+            except ImportError as exc:
+                raise RuntimeError("HEIC image ke liye: pip install pillow-heif") from exc
+
+        try:
+            image = Image.open(io.BytesIO(file_bytes))
+            image.load()
+        except Exception as exc:
+            raise RuntimeError(f"Image khul nahi payi (corrupt ya unsupported): {exc}") from exc
+
+        frames = []
+        for number, frame in enumerate(ImageSequence.Iterator(image)):
+            if number >= MAX_OCR_FRAMES:
+                break
+            frames.append(frame.copy())
+        return "\n".join(ocr_image(frame) for frame in (frames or [image]))
 
     return file_bytes.decode("utf-8", errors="ignore")
 
@@ -986,9 +1129,10 @@ with st.sidebar:
     st.header("📤 Upload CV")
     uploaded_file = st.file_uploader(
         "Upload your CV",
-        type=["pdf", "docx", "txt"],
+        type=["pdf", "docx", "txt", "png", "jpg", "jpeg", "jfif", "webp", "bmp",
+              "tif", "tiff", "gif", "heic", "heif"],
     )
-    st.caption("Tip: text-based PDF works best. Scanned PDFs need OCR.")
+    st.caption("Tip: text-based PDF best hai. Image/scanned CV ke liye OCR (Tesseract) chahiye.")
 
     st.divider()
     st.markdown(
@@ -1016,7 +1160,7 @@ st.markdown(
 )
 
 if not uploaded_file:
-    st.info("👈 Sidebar se apna CV upload karo — PDF, DOCX ya TXT.")
+    st.info("👈 Sidebar se apna CV upload karo — PDF, DOCX, TXT ya Image.")
     st.stop()
 
 file_bytes = uploaded_file.getvalue()
@@ -1029,7 +1173,7 @@ except Exception as error:
     st.stop()
 
 if len(data["text"].strip()) < 50:
-    st.warning("CV se text extract nahi hua. Ye scanned image PDF ho sakti hai.")
+    st.warning("CV se text extract nahi hua. Scanned/image CV ke liye pytesseract + Tesseract install karo, ya clear photo upload karo.")
     st.stop()
 
 # ---- editable values: reset whenever a different file is uploaded ----------
