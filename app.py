@@ -292,6 +292,20 @@ def read_cv(file_name: str, file_bytes: bytes) -> str:
         import docx
         document = docx.Document(io.BytesIO(file_bytes))
         parts = [p.text for p in document.paragraphs]
+
+        for table in document.tables:
+            for row in table.rows:
+                parts.append(" | ".join(cell.text for cell in row.cells))
+
+        return "
+".join(parts)
+
+    return file_bytes.decode("utf-8", errors="ignore")
+
+if name.endswith(".docx"):
+        import docx
+        document = docx.Document(io.BytesIO(file_bytes))
+        parts = [p.text for p in document.paragraphs]
         for table in document.tables:
             for row in table.rows:
                 parts.append(" | ".join(cell.text for cell in row.cells))
