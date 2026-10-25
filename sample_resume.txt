@@ -1,0 +1,30 @@
+Aarav Sharma
+Mumbai, Maharashtra
+Email: aarav.sharma@example.com
+Phone: +91 98765 43210
+LinkedIn: https://www.linkedin.com/in/aarav-sharma-example
+GitHub: https://github.com/aarav-sharma-example
+
+PROFESSIONAL SUMMARY
+Computer Science student interested in Python development and data analysis. Comfortable with programming fundamentals, SQL and building small academic projects. Looking for an entry-level opportunity to learn and contribute to a software team.
+
+SKILLS
+Python, Java, SQL, HTML, CSS, JavaScript, Pandas, NumPy, Excel, Git, GitHub, Linux, Communication, Teamwork
+
+EDUCATION
+BSc Computer Science, Example College, Mumbai, 2027
+HSC Science, Example Junior College, Mumbai, 2024, 78%
+SSC, Example School, Mumbai, 2022, 85%
+
+PROJECTS
+Student Result Management System
+Created a small academic application to organize student records and calculate results. Used Python and SQL for data handling. Practised input validation and basic report generation.
+Technologies: Python, SQL
+Role: Student developer
+
+Sales Data Analysis
+Analysed a fictional CSV dataset to calculate totals and compare monthly sales. Created summary tables and charts for a class assignment.
+Technologies: Python, Pandas, Excel
+
+CERTIFICATIONS
+Python Programming Fundamentals - Example Learning Platform - 2025
