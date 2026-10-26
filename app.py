@@ -408,8 +408,42 @@ def ocr_image(img) -> str:
         ) from exc
 
 
+def _detect_name(file_name: str, file_bytes: bytes) -> str:
+    """Decide the real file type from the content, so wrong or missing extensions still work."""
+    lower = file_name.lower()
+
+    if b"%PDF-" in file_bytes[:1024]:
+        return "file.pdf"
+
+    if file_bytes[:4] == b"\xd0\xcf\x11\xe0":
+        raise RuntimeError("Purani .doc file supported nahi hai. Usse DOCX ya PDF me save karke upload karo.")
+
+    if file_bytes[:2] == b"PK":
+        try:
+            import zipfile
+            if "word/document.xml" in zipfile.ZipFile(io.BytesIO(file_bytes)).namelist():
+                return "file.docx"
+        except Exception:
+            pass
+        raise RuntimeError("Ye file type supported nahi hai. PDF, DOCX, TXT ya Image upload karo.")
+
+    try:
+        from PIL import Image
+        Image.open(io.BytesIO(file_bytes)).verify()
+        return "file.png"
+    except Exception:
+        pass
+
+    if lower.endswith(IMAGE_EXTS) or lower.endswith((".pdf", ".docx")):
+        return lower  # damaged or special file: let the reader give a clear error
+
+    if b"\x00" in file_bytes[:2000]:
+        raise RuntimeError("Ye file type supported nahi hai. PDF, DOCX, TXT ya Image upload karo.")
+    return "file.txt"
+
+
 def read_cv(file_name: str, file_bytes: bytes) -> str:
-    name = file_name.lower()
+    name = _detect_name(file_name, file_bytes)
 
     if name.endswith(".pdf"):
         try:
@@ -1127,10 +1161,10 @@ with st.sidebar:
 
     st.divider()
     st.header("📤 Upload CV")
-    uploaded_file = st.file_uploader(
-        "Upload your CV",
-        type=["pdf", "docx", "txt", "png", "jpg", "jpeg", "jfif", "webp", "bmp",
-              "tif", "tiff", "gif", "heic", "heif"],
+    uploaded_file = st.file_uploader("Upload your CV (PDF, DOCX, TXT ya Image)")
+    use_camera = st.checkbox("📷 Camera se CV ki photo lo")
+    camera_photo = (
+        st.camera_input("CV ki photo", label_visibility="collapsed") if use_camera else None
     )
     st.caption("Tip: text-based PDF best hai. Image/scanned CV ke liye OCR (Tesseract) chahiye.")
 
@@ -1146,6 +1180,9 @@ with st.sidebar:
         "- Project topic suggestions\n"
         "- PDF report"
     )
+
+if uploaded_file is None and camera_photo is not None:
+    uploaded_file = camera_photo
 
 st.markdown(get_css(st.session_state["theme"]), unsafe_allow_html=True)
 
