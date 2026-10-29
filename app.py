@@ -8,7 +8,8 @@ SQLite database is created automatically as resume_analyzer.db beside app.py.
 OCR for scanned PDFs/images requires the Tesseract application installed separately.
 """
 from __future__ import annotations
-import io, re, os, json, sqlite3, hashlib, secrets, zipfile
+import io, re, os, json, sqlite3, hashlib, secrets, zipfile, random, time, smtplib
+from email.mime.text import MIMEText
 from datetime import datetime
 from pathlib import Path
 from xml.sax.saxutils import escape
