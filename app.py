@@ -20,7 +20,7 @@ import streamlit as st
 
 APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "resume_analyzer.db"
-ADMIN_EMAIL = os.getenv("SCVA_ADMIN_EMAIL", "sufiyan@gmail.com").strip().lower()
+ADMIN_EMAIL = os.getenv("SCVA_ADMIN_EMAIL", "sufiyan11ko@gmail.com").strip().lower()
 MAX_FILE_MB = 10
 
 st.set_page_config(page_title="Smart CV Analyzer Pro", page_icon="📄", layout="wide", initial_sidebar_state="expanded")
