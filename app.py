@@ -371,4 +371,4 @@ elif page.startswith("📚"):
 else:
     st.markdown("## 👤 Profile"); st.write(f"**Name:** {st.session_state.get('user_name')}"); st.write(f"**Email:** {st.session_state.get('user_email')}"); total=q("SELECT COUNT(*) FROM resume_history WHERE user_id=?",(_uid,),one=True)[0]; st.metric("Resumes Analyzed",total)
 
-st.markdown('<div class="foot">Made with ❤️ | 100% Light Theme | No OCR Error | Mobile Ready</div>',unsafe_allow_html=True)
+st.markdown('<div class="foot">Crafted with ❤️ for Future Professionals | Analyze. Improve. Succeed.</div>',unsafe_allow_html=True)
