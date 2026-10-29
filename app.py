@@ -1,66 +1,21 @@
-"""
-Smart CV Analyzer Pro - FINAL PERFECT VERSION
-No Tesseract, Light Theme, Mobile Friendly, Login + History + Save
-requirements.txt: streamlit, PyPDF2, python-docx, pandas
-"""
 import hashlib, io, json, re, sqlite3
 from datetime import datetime
 from xml.sax.saxutils import escape
 import streamlit as st
-
 st.set_page_config(page_title="Smart CV Analyzer Pro", page_icon="📄", layout="centered", initial_sidebar_state="collapsed")
-
-# --- FIX FOR UPLOAD CRASH ---
 def make_card(key_name):
-    try:
-        return st.container(key=key_name)
-    except TypeError:
-        return st.container(border=True)
-
-# --- ALL LOGIC ---
-SKILLS_DB = {
-    "Programming": ["python","java","c++","c#","javascript","typescript","kotlin","swift","php","ruby","scala","matlab","c","r","go","dart","bash"],
-    "Web": ["html","css","react","angular","vue","node.js","nodejs","express","django","flask","fastapi","spring boot","bootstrap","tailwind","next.js","rest api","streamlit","wordpress","jquery"],
-    "Data & AI": ["machine learning","deep learning","nlp","computer vision","pandas","numpy","scikit-learn","tensorflow","keras","pytorch","opencv","power bi","tableau","data analysis","data visualization","matplotlib","seaborn","excel","statistics","generative ai","llm","langchain","data science"],
-    "Database": ["sql","mysql","postgresql","mongodb","sqlite","oracle","firebase","redis","nosql"],
-    "Cloud & DevOps": ["aws","azure","gcp","docker","kubernetes","jenkins","ci/cd","linux","terraform","git","github","devops"],
-    "Mobile & Other": ["android","flutter","react native","ios","cyber security","networking","iot","blockchain","selenium","junit","jira","figma","ui/ux","dsa","data structures","algorithms","oop"],
-    "Soft Skills": ["communication","leadership","teamwork","problem solving","time management","critical thinking","adaptability","creativity","collaboration","presentation"],
-}
+    try: return st.container(key=key_name)
+    except TypeError: return st.container(border=True)
+SKILLS_DB = {"Programming": ["python","java","c++","c#","javascript","typescript","kotlin","swift","php","ruby","scala","matlab","c","r","go","dart","bash"],"Web": ["html","css","react","angular","vue","node.js","nodejs","express","django","flask","fastapi","spring boot","bootstrap","tailwind","next.js","rest api","streamlit","wordpress","jquery"],"Data & AI": ["machine learning","deep learning","nlp","computer vision","pandas","numpy","scikit-learn","tensorflow","keras","pytorch","opencv","power bi","tableau","data analysis","data visualization","matplotlib","seaborn","excel","statistics","generative ai","llm","langchain","data science"],"Database": ["sql","mysql","postgresql","mongodb","sqlite","oracle","firebase","redis","nosql"],"Cloud & DevOps": ["aws","azure","gcp","docker","kubernetes","jenkins","ci/cd","linux","terraform","git","github","devops"],"Mobile & Other": ["android","flutter","react native","ios","cyber security","networking","iot","blockchain","selenium","junit","jira","figma","ui/ux","dsa","data structures","algorithms","oop"],"Soft Skills": ["communication","leadership","teamwork","problem solving","time management","critical thinking","adaptability","creativity","collaboration","presentation"],}
 AMBIGUOUS = {"c", "r", "go"}
 LABEL_OVERRIDES = {"node.js":"Node.js","nodejs":"Node.js","next.js":"Next.js","ci/cd":"CI/CD","ui/ux":"UI/UX","power bi":"Power BI","rest api":"REST API","scikit-learn":"Scikit-learn","c++":"C++","c#":"C#","ios":"iOS","nosql":"NoSQL","mysql":"MySQL","postgresql":"PostgreSQL","mongodb":"MongoDB","javascript":"JavaScript","typescript":"TypeScript","tensorflow":"TensorFlow","pytorch":"PyTorch","opencv":"OpenCV","fastapi":"FastAPI","github":"GitHub","wordpress":"WordPress","jquery":"jQuery","langchain":"LangChain","sqlite":"SQLite","spring boot":"Spring Boot","react native":"React Native"}
 def pretty(skill):
     low = skill.lower()
     if low in LABEL_OVERRIDES: return LABEL_OVERRIDES[low]
     return skill.upper() if len(skill) <= 3 else skill.title()
-SECTION_ALIASES = {
-    "education": ["education","academic qualification","academics","qualifications"],
-    "experience": ["experience","work experience","professional experience","employment history","internship","internships"],
-    "projects": ["projects","academic projects","personal projects","key projects"],
-    "skills": ["skills","technical skills","key skills","core competencies"],
-    "certifications": ["certifications","certificates","courses"],
-    "other": ["summary","objective","profile","achievements","awards"],
-}
-JOB_ROLES = {
-    "Data Scientist": {"skills": ["python","machine learning","pandas","numpy","scikit-learn","sql","statistics","deep learning","data visualization"], "companies": ["Google","Amazon","Microsoft","Fractal Analytics","Mu Sigma","Tiger Analytics"]},
-    "Data Analyst": {"skills": ["sql","excel","power bi","tableau","python","pandas","data analysis","data visualization"], "companies": ["Deloitte","EY","KPMG","Genpact","WNS","Swiggy"]},
-    "AI / ML Engineer": {"skills": ["python","tensorflow","pytorch","deep learning","nlp","computer vision","machine learning","docker","llm"], "companies": ["NVIDIA","OpenAI","Samsung R&D","Qualcomm"]},
-    "Python / Backend Developer": {"skills": ["python","django","flask","fastapi","sql","postgresql","rest api","git","docker"], "companies": ["Infosys","Zoho","Freshworks","Razorpay"]},
-    "Frontend Developer": {"skills": ["html","css","javascript","react","typescript","bootstrap","tailwind","git","figma"], "companies": ["Flipkart","Myntra","Cred","Meesho"]},
-    "Full Stack Developer": {"skills": ["html","css","javascript","react","node.js","mongodb","express","sql","git","rest api"], "companies": ["TCS","Infosys","Accenture","Cognizant"]},
-    "Java Developer": {"skills": ["java","spring boot","mysql","sql","rest api","oop","git","junit"], "companies": ["TCS","Infosys","Wipro","IBM","Oracle"]},
-    "DevOps / Cloud Engineer": {"skills": ["aws","azure","docker","kubernetes","linux","jenkins","ci/cd","terraform","git","bash"], "companies": ["Amazon AWS","Microsoft Azure","Red Hat"]},
-    "Android / Mobile Developer": {"skills": ["android","kotlin","java","flutter","dart","firebase","react native"], "companies": ["Google","Samsung","PhonePe","Dream11"]},
-    "Software Tester / QA": {"skills": ["selenium","junit","jira","sql","java","python","git"], "companies": ["Capgemini","Cognizant","Infosys"]},
-}
-PROJECT_IDEAS = {
-    "Data & AI": ["Resume–Job Description Matcher using NLP","Customer Churn Prediction Dashboard","Sentiment Analysis using Transformers"],
-    "Web": ["Full-Stack Job Portal","Real-time Chat App","E-commerce Platform with Payment Gateway"],
-    "Programming": ["Smart Library Management System","Algorithm Visualizer","Code Plagiarism Detector"],
-    "Database": ["Hospital Management System","Inventory Management with Analytics"],
-    "Cloud & DevOps": ["CI/CD Pipeline for Dockerized App on AWS","Kubernetes Auto-scaling Demo"],
-    "Mobile & Other": ["Flutter Expense Tracker","IoT Smart Home Monitoring","Face-recognition Attendance App"],
-}
+SECTION_ALIASES = {"education": ["education","academic qualification","academics","qualifications"],"experience": ["experience","work experience","professional experience","employment history","internship","internships"],"projects": ["projects","academic projects","personal projects","key projects"],"skills": ["skills","technical skills","key skills","core competencies"],"certifications": ["certifications","certificates","courses"],"other": ["summary","objective","profile","achievements","awards"],}
+JOB_ROLES = {"Data Scientist": {"skills": ["python","machine learning","pandas","numpy","scikit-learn","sql","statistics","deep learning","data visualization"], "companies": ["Google","Amazon","Microsoft","Fractal Analytics","Mu Sigma","Tiger Analytics"]},"Data Analyst": {"skills": ["sql","excel","power bi","tableau","python","pandas","data analysis","data visualization"], "companies": ["Deloitte","EY","KPMG","Genpact","WNS","Swiggy"]},"AI / ML Engineer": {"skills": ["python","tensorflow","pytorch","deep learning","nlp","computer vision","machine learning","docker","llm"], "companies": ["NVIDIA","OpenAI","Samsung R&D","Qualcomm"]},"Python / Backend Developer": {"skills": ["python","django","flask","fastapi","sql","postgresql","rest api","git","docker"], "companies": ["Infosys","Zoho","Freshworks","Razorpay"]},"Frontend Developer": {"skills": ["html","css","javascript","react","typescript","bootstrap","tailwind","git","figma"], "companies": ["Flipkart","Myntra","Cred","Meesho"]},"Full Stack Developer": {"skills": ["html","css","javascript","react","node.js","mongodb","express","sql","git","rest api"], "companies": ["TCS","Infosys","Accenture","Cognizant"]},"Java Developer": {"skills": ["java","spring boot","mysql","sql","rest api","oop","git","junit"], "companies": ["TCS","Infosys","Wipro","IBM","Oracle"]},"DevOps / Cloud Engineer": {"skills": ["aws","azure","docker","kubernetes","linux","jenkins","ci/cd","terraform","git","bash"], "companies": ["Amazon AWS","Microsoft Azure","Red Hat"]},"Android / Mobile Developer": {"skills": ["android","kotlin","java","flutter","dart","firebase","react native"], "companies": ["Google","Samsung","PhonePe","Dream11"]},"Software Tester / QA": {"skills": ["selenium","junit","jira","sql","java","python","git"], "companies": ["Capgemini","Cognizant","Infosys"]},}
+PROJECT_IDEAS = {"Data & AI": ["Resume–Job Description Matcher using NLP","Customer Churn Prediction Dashboard","Sentiment Analysis using Transformers"],"Web": ["Full-Stack Job Portal","Real-time Chat App","E-commerce Platform with Payment Gateway"],"Programming": ["Smart Library Management System","Algorithm Visualizer","Code Plagiarism Detector"],"Database": ["Hospital Management System","Inventory Management with Analytics"],"Cloud & DevOps": ["CI/CD Pipeline for Dockerized App on AWS","Kubernetes Auto-scaling Demo"],"Mobile & Other": ["Flutter Expense Tracker","IoT Smart Home Monitoring","Face-recognition Attendance App"],}
 GENERIC_IDEAS = ["Portfolio Website with Blog","AI Chatbot for FAQs using RAG","Weather and Air-Quality Dashboard"]
 ATS_ACTION_VERBS = ["developed","designed","built","created","implemented","improved","optimized","automated","led","managed","analyzed","deployed","tested"]
 METRIC_RE = re.compile(r"\d+\s?%|\d+\+|\$\s?\d+|₹\s?\d+")
@@ -69,7 +24,6 @@ PHONE_RE = re.compile(r"(?:\+?\d{1,3}[\s-]?)?(?:\(?\d{3,5}\)?[\s.-]?)?\d{3,5}[\s
 LINKEDIN_RE = re.compile(r"(?:https?://)?(?:www\.)?linkedin\.com/in/[\w\-%]+", re.I)
 GITHUB_RE = re.compile(r"(?:https?://)?(?:www\.)?github\.com/[\w\-]+", re.I)
 DEGREE_RE = re.compile(r"\b(b\.?\s?tech|m\.?\s?tech|bca|mca|bba|mba|b\.?\s?sc|m\.?\s?sc|bachelor|master)\b", re.I)
-
 def extract_email(t): m=EMAIL_RE.search(t); return m.group(0) if m else "Not found"
 def extract_phone(t):
     for m in PHONE_RE.finditer(t):
@@ -165,19 +119,24 @@ def suggest_projects(skills_by_cat):
             if idea not in seen: ideas.append((cat,idea)); seen.add(idea)
     for idea in GENERIC_IDEAS: ideas.append(("General",idea))
     return ideas[:12]
-
-# --- NO TESSERACT - ONLY PDF/DOCX/TXT ---
 def parse_pdf(data:bytes)->str:
     from PyPDF2 import PdfReader; reader=PdfReader(io.BytesIO(data)); return "\n".join((p.extract_text() or "") for p in reader.pages)
 def parse_docx(data:bytes)->str:
     import docx; document=docx.Document(io.BytesIO(data)); parts=[p.text for p in document.paragraphs]; return "\n".join(parts)
+def parse_image(data:bytes)->str:
+    from PIL import Image
+    import pytesseract
+    img=Image.open(io.BytesIO(data))
+    text=pytesseract.image_to_string(img)
+    if not text.strip(): raise ValueError("Image me text clear nahi hai")
+    return text
 def read_file(name:str,data:bytes)->str:
     lower=name.lower()
     if lower.endswith(".pdf"): return parse_pdf(data)
     if lower.endswith(".docx"): return parse_docx(data)
     if lower.endswith(".txt"): return data.decode("utf-8",errors="ignore")
-    raise ValueError("Only PDF, DOCX, TXT supported")
-
+    if lower.endswith((".jpg",".jpeg",".png")): return parse_image(data)
+    raise ValueError("Only PDF, DOCX, TXT, JPG, PNG supported")
 def analyze(text,jd):
     low=text.lower(); words=len(text.split()); SPEC_SKILLS=["python","java","c++","javascript","react","node.js","sql","mysql","machine learning","deep learning","data analysis","excel","power bi","communication","leadership","teamwork","aws","docker","git","html","css","tensorflow","pytorch","nlp","pandas","numpy","streamlit","flask","django"]
     def find_skills(t):
@@ -211,30 +170,7 @@ def report_text(res:dict)->str:
     if adv: d=adv["data"]; lines+=["",f"Detailed CV Score: {adv['total']}/100",f"Name: {d['name']}",f"Email: {d['email']}",f"Phone: {d['phone']}","", "Best matching roles:"]; lines+=[f"  - {j['Role']} ({j['Match %']}%)" for j in adv["jobs"][:5]]
     return "\n".join(lines)
 TIPS={"Email address":"Add a professional email address","Phone number":"Add phone number","Skills keywords":"Add Skills section","Education section":"Add Education","Experience section":"Add experience","Length (300+ words)":"Expand to 300+ words","Action verbs":"Use action verbs like built, developed"}
-
-# --- LIGHT THEME FORCE ---
-st.markdown("""<style>
-:root { color-scheme: light only; }
-[data-testid="stSidebar"]{display:none} #MainMenu,footer,header[data-testid="stHeader"]{visibility:hidden;height:0}
-.stApp{background:#f8f9fb} .block-container{padding-top:0.8rem;max-width:780px}
-.stApp p, .stApp label, .stApp h1, .stApp h2, .stApp h3, .stApp h4{color:#1f2937}
-.hero{background:linear-gradient(135deg,#6e56ff,#ff5a8a);border-radius:16px;padding:14px;text-align:center;margin-bottom:12px}
-.hero h1{color:#fff!important;font-size:1.4rem;margin:0} 
-.upload-title{font-size:1.3rem;font-weight:800;text-align:center;color:#1f2937;margin-bottom:8px}
-[data-testid="stVerticalBlockBorderWrapper"]{background:#fff;border:1px solid #e5e7eb;border-radius:18px;padding:18px;box-shadow:0 6px 20px rgba(17,24,39,.07)}
-textarea,input{background:#fff!important;color:#111827!important}
-[data-testid="stFileUploaderDropzone"]{background:#f3f4f6!important;border:1px dashed #9ca3af}
-.stButton>button{width:100%;border-radius:14px;font-weight:800;padding:.7rem 1rem;border:none;background:linear-gradient(135deg,#6e56ff,#8b6bff)!important}
-.stButton>button *{color:#fff!important}
-.mbox{background:#fff;border:1px solid #e5e7eb;border-radius:16px;padding:16px 8px;text-align:center;margin-bottom:10px}
-.mbox .v{font-size:1.8rem;font-weight:800;color:#6e56ff} .mbox .l{font-size:.85rem;color:#6b7280;font-weight:600}
-.panel{background:#fff;border:1px solid #e5e7eb;border-radius:16px;padding:14px 16px;margin-bottom:12px}
-.chip{display:inline-block;padding:4px 11px;margin:3px;border-radius:999px;background:#eef0ff;border:1px solid #c9c2ff;color:#3b2fb0!important;font-size:.82rem}
-.chip.ok{background:#e8f8ee;border-color:#a7e3bd;color:#166534!important} .chip.miss{background:#fdecec;border-color:#f5b5b5;color:#991b1b!important}
-.foot{text-align:center;color:#6b7280;font-size:.85rem;margin-top:28px}
-</style>""",unsafe_allow_html=True)
-
-# --- DB ---
+st.markdown("""<style>:root { color-scheme: light only; }[data-testid="stSidebar"]{display:none} #MainMenu,footer,header[data-testid="stHeader"]{visibility:hidden;height:0}.stApp{background:#f8f9fb} .block-container{padding-top:0.8rem;max-width:780px}.stApp p, .stApp label, .stApp h1, .stApp h2, .stApp h3, .stApp h4{color:#1f2937}.hero{background:linear-gradient(135deg,#6e56ff,#ff5a8a);border-radius:16px;padding:14px;text-align:center;margin-bottom:12px}.hero h1{color:#fff!important;font-size:1.4rem;margin:0} .upload-title{font-size:1.3rem;font-weight:800;text-align:center;color:#1f2937;margin-bottom:8px}[data-testid="stVerticalBlockBorderWrapper"]{background:#fff;border:1px solid #e5e7eb;border-radius:18px;padding:18px;box-shadow:0 6px 20px rgba(17,24,39,.07)}textarea,input{background:#fff!important;color:#111827!important}[data-testid="stFileUploaderDropzone"]{background:#f3f4f6!important;border:1px dashed #9ca3af}.stButton>button{width:100%;border-radius:14px;font-weight:800;padding:.7rem 1rem;border:none;background:linear-gradient(135deg,#6e56ff,#8b6bff)!important}.stButton>button *{color:#fff!important}.mbox{background:#fff;border:1px solid #e5e7eb;border-radius:16px;padding:16px 8px;text-align:center;margin-bottom:10px}.mbox .v{font-size:1.8rem;font-weight:800;color:#6e56ff} .mbox .l{font-size:.85rem;color:#6b7280;font-weight:600}.panel{background:#fff;border:1px solid #e5e7eb;border-radius:16px;padding:14px 16px;margin-bottom:12px}.chip{display:inline-block;padding:4px 11px;margin:3px;border-radius:999px;background:#eef0ff;border:1px solid #c9c2ff;color:#3b2fb0!important;font-size:.82rem}.chip.ok{background:#e8f8ee;border-color:#a7e3bd;color:#166534!important} .chip.miss{background:#fdecec;border-color:#f5b5b5;color:#991b1b!important}.foot{text-align:center;color:#6b7280;font-size:.85rem;margin-top:28px}</style>""",unsafe_allow_html=True)
 DB_FILE="resume_analyzer.db"
 def q(sql,args=(),one=False,commit=False):
     conn=sqlite3.connect(DB_FILE); cur=conn.execute(sql,args); out=cur.fetchone() if one else cur.fetchall()
@@ -251,7 +187,6 @@ init_db()
 for _k,_v in {"logged_in":False,"user_id":None,"user_name":"","user_email":""}.items(): st.session_state.setdefault(_k,_v)
 def logout():
     for k in list(st.session_state.keys()): del st.session_state[k]
-
 def render_results(res:dict,key:str="cur"):
     st.markdown("## 📊 Results")
     c1,c2,c3=st.columns(3)
@@ -286,10 +221,7 @@ def render_results(res:dict,key:str="cur"):
             st.progress(adv["jd"]["match_percent"]/100)
             st.write(f"Match: {adv['jd']['match_percent']}%")
     st.download_button("⬇️ Download Full Report (TXT)",report_text(res),file_name="cv_report.txt",mime="text/plain",key=f"dl_{key}")
-
-# --- MAIN ---
 st.markdown("""<div class="hero"><h1>📄 Smart CV Analyzer Pro</h1></div>""",unsafe_allow_html=True)
-
 if not st.session_state.get("logged_in"):
     with make_card("auth_card"):
         st.markdown('<div class="upload-title">🔐 Login to Continue</div>',unsafe_allow_html=True)
@@ -313,29 +245,25 @@ if not st.session_state.get("logged_in"):
             if st.button("Reset Password",key="b_reset",type="primary"):
                 if not q("SELECT id FROM users WHERE email=?",(e3.strip().lower(),),one=True): st.error("Email not found.")
                 else: q("UPDATE users SET password_hash=? WHERE email=?",(hp(np1),e3.strip().lower()),commit=True); st.success("✅ Password updated.")
-    st.markdown('<div class="foot">Made with ❤️ for Students | Light Theme</div>',unsafe_allow_html=True); st.stop()
-
+    st.markdown('<div class="foot">Crafted for Careers | Analyze. Improve. Get Hired.</div>',unsafe_allow_html=True); st.stop()
 _uid=st.session_state["user_id"]
 nav_col,out_col=st.columns([4,1])
 with nav_col: page=st.radio("Menu",["🔍 Analyzer","📚 History","👤 Profile"],horizontal=True,key="nav",label_visibility="collapsed")
 with out_col:
     if st.button("🚪 Logout",key="b_logout"): logout(); st.rerun()
-
 if page.startswith("🔍"):
-    # --- UPLOAD IN CENTER - NO SLIDE NEEDED ---
     with make_card("upload_center"):
         st.markdown('<div class="upload-title">📤 UPLOAD YOUR CV</div>',unsafe_allow_html=True)
-        st.markdown('<p style="text-align:center;color:#6b7280;">PDF, DOCX, TXT - Instant Professional Analysis</p>',unsafe_allow_html=True)
+        st.markdown('<p style="text-align:center;color:#6b7280;">PDF, DOCX, TXT, JPG, PNG - All Supported</p>',unsafe_allow_html=True)
         mode=st.radio("Input method",["Upload File","Paste Text"],horizontal=True,label_visibility="collapsed",key="mode_radio")
         uploaded,pasted=None,""
         if mode=="Upload File":
-            uploaded=st.file_uploader("Upload resume",type=["pdf","docx","txt"],label_visibility="collapsed",key="resume_uploader")
+            uploaded=st.file_uploader("Upload resume",type=["pdf","docx","txt","jpg","jpeg","png"],label_visibility="collapsed",key="resume_uploader")
             if uploaded: st.success(f"✅ Uploaded: {uploaded.name}")
         else: pasted=st.text_area("Paste resume text",height=220,label_visibility="collapsed",placeholder="Paste your resume text here...",key="paste_area")
         st.markdown("**💼 Job Description (Optional)**")
         jd_text=st.text_area("Job description",height=90,label_visibility="collapsed",placeholder="Paste JD for better matching...",key="jd_area")
         go=st.button("🔍 Analyze Resume Now",type="primary",key="analyze_btn")
-    
     if go:
         text,fname="", "Pasted Text"
         try:
@@ -350,7 +278,6 @@ if page.startswith("🔍"):
             except: pass
     res=st.session_state.get("result")
     if res: render_results(res,"cur")
-
 elif page.startswith("📚"):
     import pandas as pd
     st.markdown("## 📚 History - Saved Data")
@@ -370,5 +297,4 @@ elif page.startswith("📚"):
                 if st.button("🗑️ Delete",key=f"x{rid}"): q("DELETE FROM resume_history WHERE id=? AND user_id=?",(rid,_uid),commit=True); st.rerun()
 else:
     st.markdown("## 👤 Profile"); st.write(f"**Name:** {st.session_state.get('user_name')}"); st.write(f"**Email:** {st.session_state.get('user_email')}"); total=q("SELECT COUNT(*) FROM resume_history WHERE user_id=?",(_uid,),one=True)[0]; st.metric("Resumes Analyzed",total)
-
-st.markdown('<div class="foot">Crafted with ❤️ for Future Professionals | Analyze. Improve. Succeed.</div>',unsafe_allow_html=True)
+st.markdown('<div class="foot">Crafted for Careers | Analyze. Improve. Get Hired.</div>',unsafe_allow_html=True)
