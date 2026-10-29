@@ -76,6 +76,24 @@ def verify_password(password: str, stored: str) -> bool:
     except Exception:
         pass
     return False
+def generate_otp():
+    return str(random.randint(100000, 999999))
+
+def send_otp_email(to_email, otp, purpose="Verification"):
+    try:
+        EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS") or st.secrets.get("EMAIL_ADDRESS")
+        EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD") or st.secrets.get("EMAIL_PASSWORD")
+        msg = MIMEText(f"Your Smart CV Analyzer {purpose} OTP is: {otp}\n\nValid for 5 minutes.")
+        msg['Subject'] = f"Your OTP {otp} - {purpose}"
+        msg['From'] = EMAIL_ADDRESS
+        msg['To'] = to_email
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
+            server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
+            server.send_message(msg)
+        return True
+    except Exception as e:
+        st.error(f"Email Error: {e}")
+        return False
 
 init_db()
 
