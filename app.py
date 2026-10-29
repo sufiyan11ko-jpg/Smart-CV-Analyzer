@@ -397,7 +397,7 @@ def auth_screen():
     hero("📄 Smart CV Analyzer Pro","Analyze your CV, discover job matches, and keep track of your progress.")
     _,mid,_=st.columns([1,1.5,1])
     with mid:
-        login,signup,reset=st.tabs(["🔐 Login","📝 Create account","🔑 Reset password"])
+        login,signup,reset=st.tabs(["🔐 Login","📝 Create account","🔑 Reset with OTP"])
         with login:
             e=st.text_input("Email",key="login_email").strip().lower()
             p=st.text_input("Password",type="password",key="login_pass")
@@ -408,33 +408,54 @@ def auth_screen():
                     st.rerun()
                 else: st.error("Email or password is incorrect.")
         with signup:
+            st.info("Email pe OTP jayega")
             n=st.text_input("Full name",key="signup_name")
             e2=st.text_input("Email",key="signup_email").strip().lower()
-            p1=st.text_input("Password (minimum 8 characters)",type="password",key="signup_pass")
-            p2=st.text_input("Confirm password",type="password",key="signup_confirm")
-            if st.button("Create account",type="primary",use_container_width=True):
-                if not n.strip() or not e2 or not p1: st.error("Please fill in every field.")
-                elif not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+",e2): st.error("Enter a valid email.")
-                elif len(p1)<8: st.error("Use at least 8 characters.")
-                elif p1!=p2: st.error("Passwords do not match.")
+            p1=st.text_input("Password (min 8 chars)",type="password",key="signup_pass")
+            if st.button("Send OTP"):
+                if not n or not e2 or len(p1)<8:
+                    st.error("Sahi bharo")
                 else:
+                    otp = generate_otp()
+                    if send_otp_email(e2, otp, "Signup"):
+                        st.session_state["signup_otp"] = otp
+                        st.session_state["signup_data"] = (n, e2, p1)
+                        st.session_state["otp_time"] = time.time()
+                        st.success(f"OTP sent to {e2}")
+            otp_input = st.text_input("Enter OTP", key="signup_otp_input")
+            if st.button("Verify & Create Account",type="primary",use_container_width=True):
+                if otp_input == st.session_state.get("signup_otp"):
+                    n2,e2,p2 = st.session_state["signup_data"]
                     try:
-                        query("INSERT INTO users(name,email,password_hash,created_at) VALUES(?,?,?,?)",(n.strip(),e2,password_hash(p1),datetime.now().strftime("%Y-%m-%d")),commit=True)
-                        st.success("Account created. Please log in.")
-                    except sqlite3.IntegrityError: st.error("That email is already registered.")
-        with reset:
-            st.warning("For this local/demo app, password reset verifies your email and full name. For a public deployment, configure verified email OTP/reset links.")
-            er=st.text_input("Registered email",key="reset_email").strip().lower()
-            nr=st.text_input("Full name on account",key="reset_name")
-            np=st.text_input("New password (minimum 8 characters)",type="password",key="reset_pass")
-            if st.button("Reset password",use_container_width=True):
-                u=query("SELECT id,name FROM users WHERE email=?",(er,),one=True)
-                if not u or u["name"].casefold()!=nr.strip().casefold(): st.error("Email and account name do not match.")
-                elif len(np)<8: st.error("Use at least 8 characters.")
+                        query("INSERT INTO users(name,email,password_hash,created_at) VALUES(?,?,?,?)",(n2.strip(),e2,password_hash(p2),datetime.now().strftime("%Y-%m-%d")),commit=True)
+                        st.success("Account created! Login karo")
+                    except sqlite3.IntegrityError:
+                        st.error("Email already registered")
                 else:
-                    query("UPDATE users SET password_hash=? WHERE id=?",(password_hash(np),u["id"]),commit=True)
-                    st.success("Password updated. You can log in.")
-    st.caption("Privacy: CVs and analysis history are stored in the local SQLite database on this computer/server.")
+                    st.error("Invalid OTP")
+        with reset:
+            st.info("Ab naam ki zarurat nahi, sirf OTP se reset hoga!")
+            er=st.text_input("Registered email",key="reset_email").strip().lower()
+            if st.button("Send Reset OTP"):
+                u=query("SELECT id FROM users WHERE email=?",(er,),one=True)
+                if not u:
+                    st.error("Email registered nahi hai")
+                else:
+                    otp = generate_otp()
+                    if send_otp_email(er, otp, "Password Reset"):
+                        st.session_state["reset_otp"] = otp
+                        st.session_state["reset_email"] = er
+                        st.session_state["reset_otp_time"] = time.time()
+                        st.success(f"OTP sent to {er}")
+            otp_r = st.text_input("Enter OTP",key="reset_otp_input")
+            np=st.text_input("New password",type="password",key="reset_pass_new")
+            if st.button("Verify OTP & Reset",use_container_width=True):
+                if otp_r == st.session_state.get("reset_otp"):
+                    query("UPDATE users SET password_hash=? WHERE email=?",(password_hash(np), st.session_state["reset_email"]),commit=True)
+                    st.success("Password reset ho gaya!")
+                else:
+                    st.error("Invalid OTP")
+        st.caption("Privacy: CVs and analysis are stored locally in your DB and never uploaded anywhere.")
 
 if not st.session_state.logged_in:
     auth_screen()
