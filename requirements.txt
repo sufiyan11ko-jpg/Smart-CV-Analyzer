@@ -5,4 +5,5 @@ pdfplumber
 python-docx
 Pillow
 pytesseract
+matplotlib
 reportlab
