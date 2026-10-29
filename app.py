@@ -1,11 +1,9 @@
 """
-CV Analyzer Pro - Streamlit Mini Project
-Install: pip install streamlit pandas plotly pdfplumber python-docx reportlab
+Smart CV Analyzer Pro - Auth + History + Advanced CV Analysis (single file)
+Install: pip install -r requirements.txt   (OCR also needs the Tesseract program)
 Run:     streamlit run app.py
 """
-
-import io
-import re
+import io, re, json, os, sqlite3, hashlib, zipfile, shutil
 from datetime import datetime
 from xml.sax.saxutils import escape
 
@@ -14,1633 +12,953 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-# ----------------------------------------------------------------------------
-# PAGE CONFIG
-# ----------------------------------------------------------------------------
-st.set_page_config(
-    page_title="CV Analyzer Pro",
-    page_icon="📄",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+st.set_page_config(page_title="Smart CV Analyzer Pro", page_icon="📄", layout="wide", initial_sidebar_state="expanded")
+DB = "resume_analyzer.db"
 
-# ----------------------------------------------------------------------------
-# THEME
-# ----------------------------------------------------------------------------
-if "theme" not in st.session_state:
-    st.session_state["theme"] = "Dark"
+# ============================== DATABASE ==============================
+def db():
+    return sqlite3.connect(DB)
 
+def q(sql, args=(), one=False, commit=False):
+    c = db()
+    try:
+        cur = c.execute(sql, args)
+        r = cur.fetchone() if one else cur.fetchall()
+        if commit:
+            c.commit()
+        return r
+    finally:
+        c.close()
 
-def get_css(theme: str) -> str:
+def init_db():
+    c = db()
+    c.execute("""CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT, email TEXT UNIQUE, password_hash TEXT, created_at TEXT)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS resume_history(id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER, file_name TEXT, category TEXT, ats_score REAL, found_skills TEXT,
+        missing_skills TEXT, extracted_text TEXT, analysis_date TEXT)""")
+    cols = [r[1] for r in c.execute("PRAGMA table_info(resume_history)")]
+    if "full_json" not in cols:
+        c.execute("ALTER TABLE resume_history ADD COLUMN full_json TEXT")
+    c.commit(); c.close()
+
+def hp(p):
+    return hashlib.sha256(p.encode()).hexdigest()
+
+init_db()
+
+# ============================== THEME / UI HELPERS ==============================
+st.session_state.setdefault("theme", "Dark")
+
+def get_css(theme):
     if theme == "Dark":
-        bg = "#0b1020"
-        card = "#111827"
-        border = "#2b3245"
-        text = "#e5e7eb"
-        sub = "#9ca3af"
+        bg, card, border, text, sub = "#0b1020", "#111827", "#2b3245", "#e5e7eb", "#9ca3af"
     else:
-        bg = "#f8fafc"
-        card = "#ffffff"
-        border = "#e2e8f0"
-        text = "#0f172a"
-        sub = "#475569"
+        bg, card, border, text, sub = "#f8fafc", "#ffffff", "#e2e8f0", "#0f172a", "#475569"
+    return f"""<style>
+.stApp {{ background:{bg}; color:{text}; }}
+.block-container {{ padding-top:1.2rem; max-width:1400px; }}
+h1,h2,h3,h4,h5,h6,p,span,label,div {{ color:{text}; }}
+.hero {{ background:linear-gradient(120deg,#4f46e5,#7c3aed,#db2777); padding:30px 34px; border-radius:20px; margin-bottom:18px; box-shadow:0 12px 30px rgba(124,58,237,.25); }}
+.hero h1,.hero p {{ color:white !important; margin:0; }}
+.hero h1 {{ font-size:2.2rem; }} .hero p {{ margin-top:8px; opacity:.92; }}
+.card {{ background:{card}; border:1px solid {border}; border-radius:16px; padding:18px 20px; box-shadow:0 4px 18px rgba(0,0,0,.08); margin-bottom:8px; }}
+.kpi {{ background:{card}; border:1px solid {border}; border-radius:16px; padding:18px; text-align:center; }}
+.kpi .label {{ font-size:.85rem; color:{sub}; font-weight:600; }}
+.kpi .value {{ font-size:2rem; font-weight:800; margin-top:4px; }}
+.chip {{ display:inline-block; padding:5px 12px; margin:3px; border-radius:999px; background:rgba(124,58,237,.14); border:1px solid rgba(124,58,237,.38); font-size:.84rem; font-weight:500; }}
+.chip.miss {{ background:rgba(220,38,38,.12); border-color:rgba(220,38,38,.38); }}
+.chip.ok {{ background:rgba(22,163,74,.12); border-color:rgba(22,163,74,.38); }}
+.section-title {{ font-size:1.15rem; font-weight:800; margin:14px 0 8px; }}
+.small {{ color:{sub}; font-size:.88rem; }}
+.stTabs [data-baseweb="tab-list"] {{ gap:8px; }}
+.stTabs [data-baseweb="tab"] {{ border-radius:12px 12px 0 0; padding:10px 18px; }}
+.stDownloadButton button,.stButton button {{ border-radius:12px; font-weight:700; }}
+</style>"""
 
-    return f"""
-<style>
-.stApp {{ background: {bg}; color: {text}; }}
-.block-container {{ padding-top: 1.2rem; max-width: 1400px; }}
-h1, h2, h3, h4, h5, h6, p, span, label, div {{ color: {text}; }}
-.hero {{
-    background: linear-gradient(120deg,#4f46e5,#7c3aed,#db2777);
-    padding: 30px 34px; border-radius: 20px; color: white; margin-bottom: 18px;
-    box-shadow: 0 12px 30px rgba(124,58,237,.25);
-}}
-.hero h1 {{ margin: 0; color: white; font-size: 2.25rem; }}
-.hero p {{ margin: 8px 0 0; color: rgba(255,255,255,.92); font-size: 1.02rem; }}
-.card {{
-    background: {card}; border: 1px solid {border}; border-radius: 16px;
-    padding: 18px 20px; box-shadow: 0 4px 18px rgba(0,0,0,.08); margin-bottom: 8px;
-}}
-.kpi {{
-    background: {card}; border: 1px solid {border}; border-radius: 16px;
-    padding: 18px; text-align: center;
-}}
-.kpi .label {{ font-size: .85rem; color: {sub}; font-weight: 600; }}
-.kpi .value {{ font-size: 2rem; font-weight: 800; margin-top: 4px; }}
-.chip {{
-    display: inline-block; padding: 5px 12px; margin: 3px; border-radius: 999px;
-    background: rgba(124,58,237,.14); border: 1px solid rgba(124,58,237,.38);
-    font-size: .84rem; font-weight: 500;
-}}
-.chip.miss {{
-    background: rgba(220,38,38,.12); border-color: rgba(220,38,38,.38);
-}}
-.chip.ok {{
-    background: rgba(22,163,74,.12); border-color: rgba(22,163,74,.38);
-}}
-.section-title {{
-    font-size: 1.15rem; font-weight: 800; margin: 14px 0 8px;
-}}
-.small {{ color: {sub}; font-size: .88rem; }}
-.stTabs [data-baseweb="tab-list"] {{ gap: 8px; }}
-.stTabs [data-baseweb="tab"] {{
-    border-radius: 12px 12px 0 0; padding: 10px 18px;
-}}
-.stDownloadButton button, .stButton button {{
-    border-radius: 12px; font-weight: 700;
-}}
-</style>
-"""
-
-
-def chart_font_color() -> str:
+def chart_font_color():
     return "#e5e7eb" if st.session_state.get("theme") == "Dark" else "#0f172a"
 
-
 def show_chart(fig):
-    """Works on old and new Streamlit versions."""
     try:
         st.plotly_chart(fig, width="stretch")
     except Exception:
         st.plotly_chart(fig, use_container_width=True)
 
+def show_df(df):
+    try:
+        st.dataframe(df, width="stretch", hide_index=True)
+    except Exception:
+        st.dataframe(df, use_container_width=True, hide_index=True)
 
-# ----------------------------------------------------------------------------
-# KNOWLEDGE BASE
-# ----------------------------------------------------------------------------
+def kpi(label, value):
+    return f'<div class="kpi"><div class="label">{escape(str(label))}</div><div class="value">{escape(str(value))}</div></div>'
+
+def chips(items, cls=""):
+    return "".join(f'<span class="chip {cls}">{escape(str(i))}</span>' for i in items)
+
+def footer():
+    st.markdown("---")
+    st.markdown("<p style='text-align:center'>Built with ❤️ by Sufiyan</p>", unsafe_allow_html=True)
+
+# ============================== KNOWLEDGE BASE ==============================
 SKILLS_DB = {
-    "Programming": [
-        "python", "java", "c++", "c#", "javascript", "typescript", "kotlin", "swift",
-        "php", "ruby", "scala", "matlab", "c", "r", "go", "dart", "bash"
-    ],
-    "Web": [
-        "html", "css", "react", "angular", "vue", "node.js", "nodejs", "express", "django",
-        "flask", "fastapi", "spring boot", "bootstrap", "tailwind", "next.js", "rest api",
-        "streamlit", "wordpress", "jquery"
-    ],
-    "Data & AI": [
-        "machine learning", "deep learning", "nlp", "computer vision", "pandas", "numpy",
-        "scikit-learn", "tensorflow", "keras", "pytorch", "opencv", "power bi", "tableau",
-        "data analysis", "data visualization", "matplotlib", "seaborn", "excel",
-        "statistics", "generative ai", "llm", "langchain", "data science"
-    ],
-    "Database": [
-        "sql", "mysql", "postgresql", "mongodb", "sqlite", "oracle", "firebase", "redis", "nosql"
-    ],
-    "Cloud & DevOps": [
-        "aws", "azure", "gcp", "docker", "kubernetes", "jenkins", "ci/cd", "linux",
-        "terraform", "git", "github", "devops"
-    ],
-    "Mobile & Other": [
-        "android", "flutter", "react native", "ios", "cyber security", "networking", "iot",
-        "blockchain", "selenium", "junit", "jira", "figma", "ui/ux", "dsa",
-        "data structures", "algorithms", "oop"
-    ],
-    "Soft Skills": [
-        "communication", "leadership", "teamwork", "problem solving", "time management",
-        "critical thinking", "adaptability", "creativity", "collaboration", "presentation"
-    ],
+    "Programming": ["python","java","c++","c#","javascript","typescript","kotlin","swift","php","ruby","scala","matlab","c","r","go","dart","bash"],
+    "Web": ["html","css","react","angular","vue","node.js","nodejs","express","django","flask","fastapi","spring boot","bootstrap","tailwind","next.js","rest api","streamlit","wordpress","jquery"],
+    "Data & AI": ["machine learning","deep learning","nlp","computer vision","pandas","numpy","scikit-learn","tensorflow","keras","pytorch","opencv","power bi","tableau","data analysis","data visualization","matplotlib","seaborn","excel","statistics","generative ai","llm","langchain","data science"],
+    "Database": ["sql","mysql","postgresql","mongodb","sqlite","oracle","firebase","redis","nosql"],
+    "Cloud & DevOps": ["aws","azure","gcp","docker","kubernetes","jenkins","ci/cd","linux","terraform","git","github","devops"],
+    "Mobile & Other": ["android","flutter","react native","ios","cyber security","networking","iot","blockchain","selenium","junit","jira","figma","ui/ux","dsa","data structures","algorithms","oop"],
+    "Soft Skills": ["communication","leadership","teamwork","problem solving","time management","critical thinking","adaptability","creativity","collaboration","presentation"],
 }
-
 AMBIGUOUS = {"c", "r", "go"}
+LABEL_OVERRIDES = {"node.js":"Node.js","nodejs":"Node.js","next.js":"Next.js","ci/cd":"CI/CD","ui/ux":"UI/UX","power bi":"Power BI","rest api":"REST API","scikit-learn":"Scikit-learn","c++":"C++","c#":"C#","ios":"iOS","nosql":"NoSQL","mysql":"MySQL","postgresql":"PostgreSQL","mongodb":"MongoDB","javascript":"JavaScript","typescript":"TypeScript","tensorflow":"TensorFlow","pytorch":"PyTorch","opencv":"OpenCV","fastapi":"FastAPI","github":"GitHub","wordpress":"WordPress","jquery":"jQuery","langchain":"LangChain","sqlite":"SQLite","spring boot":"Spring Boot","react native":"React Native"}
 
-LABEL_OVERRIDES = {
-    "node.js": "Node.js", "nodejs": "Node.js", "next.js": "Next.js", "ci/cd": "CI/CD",
-    "ui/ux": "UI/UX", "power bi": "Power BI", "rest api": "REST API",
-    "scikit-learn": "Scikit-learn", "c++": "C++", "c#": "C#", "ios": "iOS",
-    "nosql": "NoSQL", "mysql": "MySQL", "postgresql": "PostgreSQL", "mongodb": "MongoDB",
-    "javascript": "JavaScript", "typescript": "TypeScript", "tensorflow": "TensorFlow",
-    "pytorch": "PyTorch", "opencv": "OpenCV", "fastapi": "FastAPI", "github": "GitHub",
-    "wordpress": "WordPress", "jquery": "jQuery", "langchain": "LangChain",
-    "sqlite": "SQLite", "spring boot": "Spring Boot", "react native": "React Native",
-}
-
-
-def pretty(skill: str) -> str:
+def pretty(skill):
     low = skill.lower()
     if low in LABEL_OVERRIDES:
         return LABEL_OVERRIDES[low]
     return skill.upper() if len(skill) <= 3 else skill.title()
 
-
 SECTION_ALIASES = {
-    "education": [
-        "education", "academic qualification", "academic qualifications", "academics",
-        "qualifications", "academic background", "educational qualification"
-    ],
-    "experience": [
-        "experience", "work experience", "professional experience", "employment history",
-        "internship", "internships", "work history", "internship experience", "training"
-    ],
-    "projects": [
-        "projects", "academic projects", "personal projects", "project work", "key projects",
-        "major projects", "project experience"
-    ],
-    "skills": [
-        "skills", "technical skills", "key skills", "core competencies", "skills & tools",
-        "technical proficiency", "it skills"
-    ],
-    "certifications": [
-        "certifications", "certificates", "courses", "training & certifications",
-        "certifications & courses"
-    ],
-    "other": [
-        "summary", "objective", "career objective", "profile", "professional summary",
-        "achievements", "awards", "hobbies", "interests", "languages", "references",
-        "declaration", "personal details", "extracurricular", "activities"
-    ],
+    "education": ["education","academic qualification","academic qualifications","academics","qualifications","academic background","educational qualification"],
+    "experience": ["experience","work experience","professional experience","employment history","internship","internships","work history","internship experience","training"],
+    "projects": ["projects","academic projects","personal projects","project work","key projects","major projects","project experience"],
+    "skills": ["skills","technical skills","key skills","core competencies","skills & tools","technical proficiency","it skills"],
+    "certifications": ["certifications","certificates","courses","training & certifications","certifications & courses"],
+    "other": ["summary","objective","career objective","profile","professional summary","achievements","awards","hobbies","interests","languages","references","declaration","personal details","extracurricular","activities"],
 }
-
 JOB_ROLES = {
-    "Data Scientist": {
-        "skills": ["python", "machine learning", "pandas", "numpy", "scikit-learn", "sql",
-                   "statistics", "deep learning", "data visualization"],
-        "companies": ["Google", "Amazon", "Microsoft", "Fractal Analytics", "Mu Sigma",
-                      "Tiger Analytics", "LatentView", "Flipkart", "Accenture AI"]
-    },
-    "Data Analyst": {
-        "skills": ["sql", "excel", "power bi", "tableau", "python", "pandas",
-                   "data analysis", "data visualization"],
-        "companies": ["Deloitte", "EY", "KPMG", "Genpact", "WNS", "Swiggy", "Zomato",
-                      "Paytm", "Cognizant"]
-    },
-    "AI / ML Engineer": {
-        "skills": ["python", "tensorflow", "pytorch", "deep learning", "nlp",
-                   "computer vision", "machine learning", "docker", "llm"],
-        "companies": ["NVIDIA", "OpenAI", "Samsung R&D", "Qualcomm", "Wipro AI",
-                      "TCS Research", "Uber", "Adobe", "Intel"]
-    },
-    "Python / Backend Developer": {
-        "skills": ["python", "django", "flask", "fastapi", "sql", "postgresql",
-                   "rest api", "git", "docker"],
-        "companies": ["Infosys", "Zoho", "Freshworks", "Razorpay", "Postman", "Atlassian",
-                      "Capgemini", "Mindtree", "Persistent Systems"]
-    },
-    "Frontend Developer": {
-        "skills": ["html", "css", "javascript", "react", "typescript", "bootstrap",
-                   "tailwind", "git", "figma"],
-        "companies": ["Flipkart", "Myntra", "Cred", "Meesho", "PhonePe", "Swiggy",
-                      "Adobe", "Wipro", "HCL Tech"]
-    },
-    "Full Stack Developer": {
-        "skills": ["html", "css", "javascript", "react", "node.js", "mongodb", "express",
-                   "sql", "git", "rest api"],
-        "companies": ["TCS", "Infosys", "Accenture", "Cognizant", "Paytm", "Ola",
-                      "ThoughtWorks", "EPAM", "Tech Mahindra"]
-    },
-    "Java Developer": {
-        "skills": ["java", "spring boot", "mysql", "sql", "rest api", "oop", "git", "junit"],
-        "companies": ["TCS", "Infosys", "Wipro", "IBM", "Oracle", "Capgemini", "Amdocs",
-                      "Goldman Sachs", "JPMorgan"]
-    },
-    "DevOps / Cloud Engineer": {
-        "skills": ["aws", "azure", "docker", "kubernetes", "linux", "jenkins", "ci/cd",
-                   "terraform", "git", "bash"],
-        "companies": ["Amazon AWS", "Microsoft Azure", "Red Hat", "Cisco", "VMware",
-                      "HCL Tech", "Tech Mahindra", "LTIMindtree"]
-    },
-    "Android / Mobile Developer": {
-        "skills": ["android", "kotlin", "java", "flutter", "dart", "firebase", "react native"],
-        "companies": ["Google", "Samsung", "PhonePe", "Dream11", "Zomato", "Paytm", "Ola"]
-    },
-    "Software Tester / QA": {
-        "skills": ["selenium", "junit", "jira", "sql", "java", "python", "git"],
-        "companies": ["Capgemini", "Cognizant", "Infosys", "Tech Mahindra", "Mphasis",
-                      "Wipro", "Accenture", "Hexaware"]
-    },
+    "Data Scientist": {"skills": ["python","machine learning","pandas","numpy","scikit-learn","sql","statistics","deep learning","data visualization"], "companies": ["Google","Amazon","Microsoft","Fractal Analytics","Mu Sigma","Tiger Analytics","LatentView","Flipkart","Accenture AI"]},
+    "Data Analyst": {"skills": ["sql","excel","power bi","tableau","python","pandas","data analysis","data visualization"], "companies": ["Deloitte","EY","KPMG","Genpact","WNS","Swiggy","Zomato","Paytm","Cognizant"]},
+    "AI / ML Engineer": {"skills": ["python","tensorflow","pytorch","deep learning","nlp","computer vision","machine learning","docker","llm"], "companies": ["NVIDIA","OpenAI","Samsung R&D","Qualcomm","Wipro AI","TCS Research","Uber","Adobe","Intel"]},
+    "Python / Backend Developer": {"skills": ["python","django","flask","fastapi","sql","postgresql","rest api","git","docker"], "companies": ["Infosys","Zoho","Freshworks","Razorpay","Postman","Atlassian","Capgemini","Mindtree","Persistent Systems"]},
+    "Frontend Developer": {"skills": ["html","css","javascript","react","typescript","bootstrap","tailwind","git","figma"], "companies": ["Flipkart","Myntra","Cred","Meesho","PhonePe","Swiggy","Adobe","Wipro","HCL Tech"]},
+    "Full Stack Developer": {"skills": ["html","css","javascript","react","node.js","mongodb","express","sql","git","rest api"], "companies": ["TCS","Infosys","Accenture","Cognizant","Paytm","Ola","ThoughtWorks","EPAM","Tech Mahindra"]},
+    "Java Developer": {"skills": ["java","spring boot","mysql","sql","rest api","oop","git","junit"], "companies": ["TCS","Infosys","Wipro","IBM","Oracle","Capgemini","Amdocs","Goldman Sachs","JPMorgan"]},
+    "DevOps / Cloud Engineer": {"skills": ["aws","azure","docker","kubernetes","linux","jenkins","ci/cd","terraform","git","bash"], "companies": ["Amazon AWS","Microsoft Azure","Red Hat","Cisco","VMware","HCL Tech","Tech Mahindra","LTIMindtree"]},
+    "Android / Mobile Developer": {"skills": ["android","kotlin","java","flutter","dart","firebase","react native"], "companies": ["Google","Samsung","PhonePe","Dream11","Zomato","Paytm","Ola"]},
+    "Software Tester / QA": {"skills": ["selenium","junit","jira","sql","java","python","git"], "companies": ["Capgemini","Cognizant","Infosys","Tech Mahindra","Mphasis","Wipro","Accenture","Hexaware"]},
 }
-
 PROJECT_IDEAS = {
-    "Data & AI": [
-        "Resume–Job Description Matcher using NLP embeddings",
-        "Customer Churn Prediction Dashboard with Explainable AI",
-        "Sentiment Analysis of Product Reviews using Transformers",
-        "Sales Forecasting System using Time-Series Models",
-        "Fake News Detection using BERT"
-    ],
-    "Web": [
-        "Full-Stack Job Portal with Role-based Authentication",
-        "Real-time Chat Application using WebSockets",
-        "E-commerce Platform with Payment Gateway Integration",
-        "Personal Finance Tracker with Interactive Charts",
-        "Online Examination System with Auto-evaluation"
-    ],
-    "Programming": [
-        "Smart Library Management System with Recommendation Engine",
-        "Algorithm Visualizer for Sorting, Graphs and DP",
-        "Code Plagiarism Detector",
-        "Command-line Task Automation Toolkit",
-        "Multiplayer Game with Leaderboard"
-    ],
-    "Database": [
-        "Hospital Management System with Optimized SQL Schema",
-        "Inventory Management with Analytics Dashboard",
-        "NoSQL-based Social Media Feed Engine"
-    ],
-    "Cloud & DevOps": [
-        "CI/CD Pipeline for a Dockerized Web App on AWS",
-        "Kubernetes-based Auto-scaling Microservices Demo",
-        "Infrastructure-as-Code using Terraform"
-    ],
-    "Mobile & Other": [
-        "Flutter Expense Tracker with Cloud Sync",
-        "IoT Smart Home Monitoring System",
-        "Face-recognition Attendance Application",
-        "Network Intrusion Detection System"
-    ],
+    "Data & AI": ["Resume–Job Description Matcher using NLP embeddings","Customer Churn Prediction Dashboard with Explainable AI","Sentiment Analysis of Product Reviews using Transformers","Sales Forecasting System using Time-Series Models","Fake News Detection using BERT"],
+    "Web": ["Full-Stack Job Portal with Role-based Authentication","Real-time Chat Application using WebSockets","E-commerce Platform with Payment Gateway Integration","Personal Finance Tracker with Interactive Charts","Online Examination System with Auto-evaluation"],
+    "Programming": ["Smart Library Management System with Recommendation Engine","Algorithm Visualizer for Sorting, Graphs and DP","Code Plagiarism Detector","Command-line Task Automation Toolkit","Multiplayer Game with Leaderboard"],
+    "Database": ["Hospital Management System with Optimized SQL Schema","Inventory Management with Analytics Dashboard","NoSQL-based Social Media Feed Engine"],
+    "Cloud & DevOps": ["CI/CD Pipeline for a Dockerized Web App on AWS","Kubernetes-based Auto-scaling Microservices Demo","Infrastructure-as-Code using Terraform"],
+    "Mobile & Other": ["Flutter Expense Tracker with Cloud Sync","IoT Smart Home Monitoring System","Face-recognition Attendance Application","Network Intrusion Detection System"],
 }
-
-GENERIC_IDEAS = [
-    "Portfolio Website with Blog and Analytics",
-    "AI Chatbot for College / Company FAQs using RAG",
-    "Weather and Air-Quality Dashboard using Public APIs"
-]
-
-ATS_ACTION_VERBS = [
-    "developed", "designed", "built", "created", "implemented", "improved", "optimized",
-    "automated", "led", "managed", "analyzed", "deployed", "tested", "reduced", "increased",
-    "achieved", "collaborated", "integrated", "maintained", "researched"
-]
-
+GENERIC_IDEAS = ["Portfolio Website with Blog and Analytics","AI Chatbot for College / Company FAQs using RAG","Weather and Air-Quality Dashboard using Public APIs"]
+ATS_ACTION_VERBS = ["developed","designed","built","created","implemented","improved","optimized","automated","led","managed","analyzed","deployed","tested","reduced","increased","achieved","collaborated","integrated","maintained","researched"]
 METRIC_RE = re.compile(r"\d+\s?%|\d+\+|\$\s?\d+|₹\s?\d+")
 
-# ----------------------------------------------------------------------------
-# TEXT EXTRACTION
-# ----------------------------------------------------------------------------
-IMAGE_EXTS = (
-    ".png", ".jpg", ".jpeg", ".jfif", ".webp", ".bmp",
-    ".tif", ".tiff", ".gif", ".heic", ".heif",
-)
-MAX_OCR_PAGES = 15
-MAX_OCR_FRAMES = 8
-
+# ============================== TEXT EXTRACTION ==============================
+IMAGE_EXTS = (".png",".jpg",".jpeg",".jfif",".webp",".bmp",".tif",".tiff",".gif",".heic",".heif")
+MAX_OCR_PAGES, MAX_OCR_FRAMES = 15, 8
 
 def _get_tesseract():
-    """Import pytesseract and auto-detect the Tesseract install location."""
     try:
         import pytesseract
     except ImportError as exc:
-        raise RuntimeError(
-            "OCR library missing hai. Terminal me chalao: pip install pytesseract pillow"
-        ) from exc
-
-    import os
-    import shutil
-
+        raise RuntimeError("OCR library missing. Run: pip install pytesseract pillow") from exc
     if shutil.which("tesseract") is None:
-        for path in (
-            r"C:\Program Files\Tesseract-OCR\tesseract.exe",
-            r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
-            "/opt/homebrew/bin/tesseract",
-            "/usr/local/bin/tesseract",
-            "/usr/bin/tesseract",
-        ):
+        for path in (r"C:\Program Files\Tesseract-OCR\tesseract.exe", r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+                     "/opt/homebrew/bin/tesseract", "/usr/local/bin/tesseract", "/usr/bin/tesseract"):
             if os.path.exists(path):
                 pytesseract.pytesseract.tesseract_cmd = path
                 break
     return pytesseract
 
-
-def _ocr_language(pytesseract) -> str:
-    try:
-        langs = set(pytesseract.get_languages(config=""))
-    except Exception:
-        return "eng"
-    return "eng+hin" if {"eng", "hin"} <= langs else "eng"
-
-
 def _prepare_image(img):
-    """Normalise any image: orientation, transparency, grayscale, contrast, size."""
     from PIL import Image, ImageOps
-
     try:
         img = ImageOps.exif_transpose(img)
     except Exception:
         pass
-
     if img.mode in ("RGBA", "LA", "P"):
         rgba = img.convert("RGBA")
-        background = Image.new("RGB", rgba.size, "white")
-        background.paste(rgba, mask=rgba.split()[-1])
-        img = background
-
+        bg = Image.new("RGB", rgba.size, "white")
+        bg.paste(rgba, mask=rgba.split()[-1])
+        img = bg
     img = ImageOps.autocontrast(img.convert("L"))
-
     longest = max(img.size)
     if longest < 2000:
-        scale = 2000 / longest
-        img = img.resize((int(img.width * scale), int(img.height * scale)), Image.LANCZOS)
+        s = 2000 / longest
+        img = img.resize((int(img.width * s), int(img.height * s)), Image.LANCZOS)
     elif longest > 5000:
-        scale = 5000 / longest
-        img = img.resize((int(img.width * scale), int(img.height * scale)), Image.LANCZOS)
+        s = 5000 / longest
+        img = img.resize((int(img.width * s), int(img.height * s)), Image.LANCZOS)
     return img
 
-
-def ocr_image(img) -> str:
-    """OCR one PIL image. Raises RuntimeError with a clear message if OCR is not set up."""
+def ocr_image(img):
     pytesseract = _get_tesseract()
-
     try:
         prepared = _prepare_image(img)
-
-        # fix sideways / upside-down scans
         try:
             osd = pytesseract.image_to_osd(prepared, config="--psm 0")
-            match = re.search(r"Rotate:\s*(\d+)", osd)
-            if match and int(match.group(1)) % 360:
-                prepared = prepared.rotate(-int(match.group(1)), expand=True, fillcolor=255)
+            m = re.search(r"Rotate:\s*(\d+)", osd)
+            if m and int(m.group(1)) % 360:
+                prepared = prepared.rotate(-int(m.group(1)), expand=True, fillcolor=255)
         except Exception:
             pass
-
-        lang = _ocr_language(pytesseract)
+        try:
+            langs = set(pytesseract.get_languages(config=""))
+            lang = "eng+hin" if {"eng", "hin"} <= langs else "eng"
+        except Exception:
+            lang = "eng"
         best = ""
-        for psm in (3, 6, 4):  # try several layout modes, keep the richest result
-            text = pytesseract.image_to_string(prepared, lang=lang, config=f"--psm {psm}")
-            if len(text.strip()) > len(best.strip()):
-                best = text
+        for psm in (3, 6, 4):
+            t = pytesseract.image_to_string(prepared, lang=lang, config=f"--psm {psm}")
+            if len(t.strip()) > len(best.strip()):
+                best = t
             if len(best.strip()) >= 200:
                 break
         return best
     except pytesseract.TesseractNotFoundError as exc:
-        raise RuntimeError(
-            "Tesseract OCR software install nahi hai. Windows: UB-Mannheim installer, "
-            "Linux: sudo apt install tesseract-ocr, Mac: brew install tesseract"
-        ) from exc
+        raise RuntimeError("Tesseract OCR is not installed. Windows: UB-Mannheim installer | Linux: sudo apt install tesseract-ocr | Mac: brew install tesseract") from exc
 
-
-def _detect_name(file_name: str, file_bytes: bytes) -> str:
-    """Decide the real file type from the content, so wrong or missing extensions still work."""
+def _detect_name(file_name, b):
     lower = file_name.lower()
-
-    if b"%PDF-" in file_bytes[:1024]:
+    if b"%PDF-" in b[:1024]:
         return "file.pdf"
-
-    if file_bytes[:4] == b"\xd0\xcf\x11\xe0":
-        raise RuntimeError("Purani .doc file supported nahi hai. Usse DOCX ya PDF me save karke upload karo.")
-
-    if file_bytes[:2] == b"PK":
+    if b[:4] == b"\xd0\xcf\x11\xe0":
+        raise RuntimeError("Old .doc files are not supported. Save as DOCX or PDF and upload again.")
+    if b[:2] == b"PK":
         try:
-            import zipfile
-            if "word/document.xml" in zipfile.ZipFile(io.BytesIO(file_bytes)).namelist():
+            if "word/document.xml" in zipfile.ZipFile(io.BytesIO(b)).namelist():
                 return "file.docx"
         except Exception:
             pass
-        raise RuntimeError("Ye file type supported nahi hai. PDF, DOCX, TXT ya Image upload karo.")
-
+        raise RuntimeError("Unsupported file type. Upload PDF, DOCX, TXT or an image.")
     try:
         from PIL import Image
-        Image.open(io.BytesIO(file_bytes)).verify()
+        Image.open(io.BytesIO(b)).verify()
         return "file.png"
     except Exception:
         pass
-
     if lower.endswith(IMAGE_EXTS) or lower.endswith((".pdf", ".docx")):
-        return lower  # damaged or special file: let the reader give a clear error
-
-    if b"\x00" in file_bytes[:2000]:
-        raise RuntimeError("Ye file type supported nahi hai. PDF, DOCX, TXT ya Image upload karo.")
+        return lower
+    if b"\x00" in b[:2000]:
+        raise RuntimeError("Unsupported file type. Upload PDF, DOCX, TXT or an image.")
     return "file.txt"
 
-
-def read_cv(file_name: str, file_bytes: bytes) -> str:
-    name = _detect_name(file_name, file_bytes)
-
+def read_cv(file_name, b):
+    name = _detect_name(file_name, b)
     if name.endswith(".pdf"):
-        try:
-            import pdfplumber
-        except ImportError as exc:
-            raise RuntimeError("pdfplumber install karo: pip install pdfplumber") from exc
-
-        ocr_error = None
-        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-            pages = []
-            for index, page in enumerate(pdf.pages):
+        import pdfplumber
+        ocr_error, pages = None, []
+        with pdfplumber.open(io.BytesIO(b)) as pdf:
+            for i, page in enumerate(pdf.pages):
                 try:
-                    page_text = page.extract_text() or ""
+                    t = page.extract_text() or ""
                 except Exception:
-                    page_text = ""
-
-                # scanned / image-only page -> OCR it
-                if len(page_text.strip()) < 30 and index < MAX_OCR_PAGES:
+                    t = ""
+                if len(t.strip()) < 30 and i < MAX_OCR_PAGES:
                     try:
-                        page_text = ocr_image(page.to_image(resolution=200).original)
+                        t = ocr_image(page.to_image(resolution=200).original)
                     except RuntimeError as exc:
                         ocr_error = str(exc)
                     except Exception:
                         pass
-                pages.append(page_text)
-
-            text = "\n".join(pages)
-
+                pages.append(t)
+        text = "\n".join(pages)
         if len(text.strip()) < 50 and ocr_error:
             raise RuntimeError(ocr_error)
         return text
-
     if name.endswith(".docx"):
-        try:
-            import docx
-        except ImportError as exc:
-            raise RuntimeError("python-docx install karo: pip install python-docx") from exc
-
-        document = docx.Document(io.BytesIO(file_bytes))
-        parts = [p.text for p in document.paragraphs]
-        for table in document.tables:
-            for row in table.rows:
-                parts.append(" | ".join(cell.text for cell in row.cells))
+        import docx
+        d = docx.Document(io.BytesIO(b))
+        parts = [p.text for p in d.paragraphs]
+        for tb in d.tables:
+            for row in tb.rows:
+                parts.append(" | ".join(c.text for c in row.cells))
         return "\n".join(parts)
-
     if name.endswith(IMAGE_EXTS):
-        try:
-            from PIL import Image, ImageSequence
-        except ImportError as exc:
-            raise RuntimeError("Pillow install karo: pip install pillow") from exc
-
+        from PIL import Image, ImageSequence
         if name.endswith((".heic", ".heif")):
             try:
                 import pillow_heif
                 pillow_heif.register_heif_opener()
             except ImportError as exc:
-                raise RuntimeError("HEIC image ke liye: pip install pillow-heif") from exc
-
+                raise RuntimeError("For HEIC images run: pip install pillow-heif") from exc
         try:
-            image = Image.open(io.BytesIO(file_bytes))
-            image.load()
+            image = Image.open(io.BytesIO(b)); image.load()
         except Exception as exc:
-            raise RuntimeError(f"Image khul nahi payi (corrupt ya unsupported): {exc}") from exc
-
+            raise RuntimeError(f"Could not open the image (corrupt or unsupported): {exc}") from exc
         frames = []
-        for number, frame in enumerate(ImageSequence.Iterator(image)):
-            if number >= MAX_OCR_FRAMES:
+        for n, fr in enumerate(ImageSequence.Iterator(image)):
+            if n >= MAX_OCR_FRAMES:
                 break
-            frames.append(frame.copy())
-        return "\n".join(ocr_image(frame) for frame in (frames or [image]))
+            frames.append(fr.copy())
+        return "\n".join(ocr_image(f) for f in (frames or [image]))
+    return b.decode("utf-8", errors="ignore")
 
-    return file_bytes.decode("utf-8", errors="ignore")
-
-
+# ============================== PARSING ==============================
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
-PHONE_RE = re.compile(
-    r"(?:\+?\d{1,3}[\s-]?)?(?:\(?\d{3,5}\)?[\s.-]?)?\d{3,5}[\s.-]?\d{4,5}"
-)
+PHONE_RE = re.compile(r"(?:\+?\d{1,3}[\s-]?)?(?:\(?\d{3,5}\)?[\s.-]?)?\d{3,5}[\s.-]?\d{4,5}")
 LINKEDIN_RE = re.compile(r"(?:https?://)?(?:www\.)?linkedin\.com/in/[\w\-%]+", re.I)
 GITHUB_RE = re.compile(r"(?:https?://)?(?:www\.)?github\.com/[\w\-]+", re.I)
+DEGREE_RE = re.compile(r"\b(b\.?\s?tech|m\.?\s?tech|b\.\s?e\.?|m\.\s?e\.?|bca|mca|bba|mba|b\.?\s?sc|m\.?\s?sc|b\.?\s?com|m\.?\s?com|b\.\s?a\.?|m\.\s?a\.?|ph\.?\s?d|diploma|bachelor|master|doctorate|12th|10th|hsc|ssc|intermediate|higher secondary|secondary|cbse|icse|polytechnic)\b", re.I)
 
+def extract_email(t):
+    m = EMAIL_RE.search(t); return m.group(0) if m else "Not found"
 
-def extract_email(text: str) -> str:
-    match = EMAIL_RE.search(text)
-    return match.group(0) if match else "Not found"
-
-
-def extract_phone(text: str) -> str:
-    for match in PHONE_RE.finditer(text):
-        digits = re.sub(r"\D", "", match.group(0))
-        if 10 <= len(digits) <= 13:
-            if not re.fullmatch(r"(19|20)\d{2}(19|20)\d{2}", digits):
-                return match.group(0).strip()
+def extract_phone(t):
+    for m in PHONE_RE.finditer(t):
+        d = re.sub(r"\D", "", m.group(0))
+        if 10 <= len(d) <= 13 and not re.fullmatch(r"(19|20)\d{2}(19|20)\d{2}", d):
+            return m.group(0).strip()
     return "Not found"
 
-
-def extract_name(text: str, email: str) -> str:
-    skip_words = (
-        "resume", "curriculum", "vitae", "cv", "profile", "objective", "summary",
-        "contact", "address", "email", "phone", "mobile", "github", "linkedin"
-    )
-
-    for line in [ln.strip() for ln in text.splitlines() if ln.strip()][:15]:
-        low = line.lower()
-        if "@" in line or any(word in low for word in skip_words) or re.search(r"\d", line):
+def extract_name(text, email):
+    skip = ("resume","curriculum","vitae","cv","profile","objective","summary","contact","address","email","phone","mobile","github","linkedin")
+    for line in [l.strip() for l in text.splitlines() if l.strip()][:15]:
+        if "@" in line or any(w in line.lower() for w in skip) or re.search(r"\d", line):
             continue
-
         words = re.sub(r"[^A-Za-z .'-]", " ", line).split()
-        if 2 <= len(words) <= 4 and all(word[0].isalpha() for word in words):
-            return " ".join(
-                word.capitalize() if not word.isupper() else word for word in words
-            )
-
+        if 2 <= len(words) <= 4 and all(w[0].isalpha() for w in words):
+            return " ".join(w.capitalize() if not w.isupper() else w for w in words)
     if email != "Not found":
-        guess = re.sub(r"[\d._-]+", " ", email.split("@")[0]).title().strip()
-        if guess:
-            return guess
-
+        g = re.sub(r"[\d._-]+", " ", email.split("@")[0]).title().strip()
+        if g:
+            return g
     return "Not found"
 
-
-def split_sections(text: str) -> dict:
-    lookup = {
-        alias: key
-        for key, aliases in SECTION_ALIASES.items()
-        for alias in aliases
-    }
-
-    sections = {key: [] for key in SECTION_ALIASES}
-    current = None
-
+def split_sections(text):
+    lookup = {a: k for k, al in SECTION_ALIASES.items() for a in al}
+    sections = {k: [] for k in SECTION_ALIASES}
+    cur = None
     for raw in text.splitlines():
         line = raw.strip()
         if not line:
             continue
-
         key = re.sub(r"[^a-z &]", "", line.lower()).strip()
-
         if len(line) < 45 and key in lookup:
-            current = lookup[key]
-            continue
-
-        if current:
-            sections[current].append(line)
-
+            cur = lookup[key]; continue
+        if cur:
+            sections[cur].append(line)
     return sections
 
+def find_pattern(text, pattern):
+    return re.search(r"(?<![A-Za-z0-9+#.])" + re.escape(pattern) + r"(?![A-Za-z0-9+#])", text or "", re.I)
 
-def find_pattern(text: str, pattern: str):
-    return re.search(
-        r"(?<![A-Za-z0-9+#.])" + re.escape(pattern) + r"(?![A-Za-z0-9+#])",
-        text or "",
-        re.I,
-    )
-
-
-def extract_skills(text: str, skills_section: str) -> dict:
+def extract_skills(text, skills_section):
     found = {}
-
-    for category, skills in SKILLS_DB.items():
-        for skill in skills:
-            hay = skills_section if skill in AMBIGUOUS else text
-            if hay and find_pattern(hay, skill):
-                label = pretty(skill)
-                found.setdefault(category, [])
-                if label not in found[category]:
-                    found[category].append(label)
-
+    for cat, skills in SKILLS_DB.items():
+        for s in skills:
+            hay = skills_section if s in AMBIGUOUS else text
+            if hay and find_pattern(hay, s):
+                lab = pretty(s)
+                found.setdefault(cat, [])
+                if lab not in found[cat]:
+                    found[cat].append(lab)
     return found
 
+def extract_education(text, lines):
+    lines = lines[:] if lines else [l.strip() for l in text.splitlines() if DEGREE_RE.search(l)]
+    return [l for l in lines if len(l) > 3][:12]
 
-DEGREE_RE = re.compile(
-    r"\b(b\.?\s?tech|m\.?\s?tech|b\.\s?e\.?|m\.\s?e\.?|bca|mca|bba|mba|b\.?\s?sc|"
-    r"m\.?\s?sc|b\.?\s?com|m\.?\s?com|b\.\s?a\.?|m\.\s?a\.?|ph\.?\s?d|diploma|bachelor|"
-    r"master|doctorate|12th|10th|hsc|ssc|intermediate|higher secondary|secondary|"
-    r"cbse|icse|polytechnic)\b",
-    re.I,
-)
+def extract_experience(lines):
+    return [l for l in lines if len(l) > 3][:15]
 
-
-def extract_education(text: str, section_lines: list) -> list:
-    lines = section_lines[:] if section_lines else [
-        line.strip() for line in text.splitlines() if DEGREE_RE.search(line)
-    ]
-    lines = [line for line in lines if len(line) > 3]
-    return lines[:12]
-
-
-def extract_experience(section_lines: list) -> list:
-    return [line for line in section_lines if len(line) > 3][:15]
-
-
-def extract_projects(section_lines: list) -> list:
-    output = []
-
-    for line in section_lines:
-        clean = line.strip()
-        if len(clean) < 4:
+def extract_projects(lines):
+    out = []
+    for line in lines:
+        c = line.strip()
+        if len(c) < 4:
             continue
+        is_title = not c.startswith(("•", "-", "*", "●", "▪")) and len(c.split()) <= 14
+        if is_title or not out:
+            out.append(c.lstrip("•-*●▪ ").strip())
+    return out[:10]
 
-        is_title = (
-            not clean.startswith(("•", "-", "*", "●", "▪"))
-            and len(clean.split()) <= 14
-        )
-
-        if is_title or not output:
-            output.append(clean.lstrip("•-*●▪ ").strip())
-
-    return output[:10]
-
-
-def extract_certifications(text: str, section_lines: list) -> list:
-    lines = section_lines[:] if section_lines else []
-
+def extract_certifications(text, lines):
+    lines = lines[:] if lines else []
     if not lines:
-        for line in text.splitlines():
-            if re.search(
-                r"\b(certified|certification|certificate|course|specialization|"
-                r"nanodegree|bootcamp)\b",
-                line,
-                re.I,
-            ):
-                lines.append(line.strip())
+        for l in text.splitlines():
+            if re.search(r"\b(certified|certification|certificate|course|specialization|nanodegree|bootcamp)\b", l, re.I):
+                lines.append(l.strip())
+    return [l.strip("•-*●▪ ") for l in lines if len(l.strip()) > 4][:12]
 
-    return [line.strip("•-*●▪ ") for line in lines if len(line.strip()) > 4][:12]
+def extract_links(text):
+    li, gh = LINKEDIN_RE.search(text), GITHUB_RE.search(text)
+    return (li.group(0) if li else None, gh.group(0) if gh else None)
 
-
-def extract_links(text: str):
-    linkedin = LINKEDIN_RE.search(text)
-    github = GITHUB_RE.search(text)
-    return (
-        linkedin.group(0) if linkedin else None,
-        github.group(0) if github else None,
-    )
-
-
-def estimate_experience_years(text: str, experience_lines: list) -> float:
-    years = [
-        float(value)
-        for value in re.findall(r"(\d+(?:\.\d+)?)\+?\s*(?:years?|yrs?)", text, re.I)
-    ]
+def estimate_experience_years(text, exp_lines):
+    years = [float(v) for v in re.findall(r"(\d+(?:\.\d+)?)\+?\s*(?:years?|yrs?)", text, re.I)]
     best = max(years) if years and max(years) < 40 else 0.0
-
-    span = 0.0
-    joined = "\n".join(experience_lines)
-    current_year = datetime.now().year
-
-    for start, end in re.findall(
-        r"((?:19|20)\d{2})\s*(?:-|–|—|to)\s*((?:19|20)\d{2}|present|current)",
-        joined,
-        re.I,
-    ):
-        end_year = current_year if end.lower() in ("present", "current") else int(end)
-        span += max(0, end_year - int(start))
-
+    span, joined, cy = 0.0, "\n".join(exp_lines), datetime.now().year
+    for s, e in re.findall(r"((?:19|20)\d{2})\s*(?:-|–|—|to)\s*((?:19|20)\d{2}|present|current)", joined, re.I):
+        ey = cy if e.lower() in ("present", "current") else int(e)
+        span += max(0, ey - int(s))
     return round(min(max(best, span), 40.0), 1)
 
+# ============================== SCORING (max 100) ==============================
+def calculate_score(d):
+    bd, tips = {}, []
+    c = (3 if d["name"] != "Not found" else 0) + (3 if d["email"] != "Not found" else 0) + (2 if d["phone"] != "Not found" else 0) + (2 if d["linkedin"] or d["github"] else 0)
+    bd["Contact Info"] = (c, 10)
+    if not (d["linkedin"] or d["github"]): tips.append("Add LinkedIn and GitHub links at the top of your CV.")
+    if c < 8: tips.append("Keep name, email and phone clearly visible in the header.")
 
-# ----------------------------------------------------------------------------
-# SCORING  (maximum total = 100)
-# ----------------------------------------------------------------------------
-def calculate_score(data: dict):
-    breakdown = {}
-    tips = []
+    tech = sum(len(i) for k, i in d["skills"].items() if k != "Soft Skills")
+    cats = len([k for k, i in d["skills"].items() if i and k != "Soft Skills"])
+    ss = min(18, tech * 1.5) + min(5, cats * 1.25) + (2 if d["skills"].get("Soft Skills") else 0)
+    bd["Skills"] = (round(min(ss, 25), 1), 25)
+    if tech < 8: tips.append("List at least 8–10 relevant technical skills, grouped by category.")
+    if not d["skills"].get("Soft Skills"): tips.append("Add soft skills such as communication, teamwork and leadership.")
 
-    # Contact - 10
-    contact = 0
-    contact += 3 if data["name"] != "Not found" else 0
-    contact += 3 if data["email"] != "Not found" else 0
-    contact += 2 if data["phone"] != "Not found" else 0
-    contact += 2 if data["linkedin"] or data["github"] else 0
-    breakdown["Contact Info"] = (contact, 10)
+    bd["Education"] = (min(10, 4 + len(d["education"]) * 2) if d["education"] else 0, 10)
+    if not d["education"]: tips.append("Add an Education section with degree, institution and year.")
 
-    if not (data["linkedin"] or data["github"]):
-        tips.append("Add LinkedIn and GitHub links at the top of your CV.")
-    if contact < 8:
-        tips.append("Keep name, email and phone clearly visible in the header.")
+    es = min(20, 8 + len(d["experience"]) * 1.2 + d["experience_years"] * 2) if d["experience"] else 0
+    bd["Experience"] = (round(es, 1), 20)
+    if not d["experience"]: tips.append("Add internships, training, freelance work or part-time experience.")
 
-    # Skills - 25
-    technical_skills = sum(
-        len(items)
-        for category, items in data["skills"].items()
-        if category != "Soft Skills"
-    )
-    skill_categories = len([
-        category for category, items in data["skills"].items()
-        if items and category != "Soft Skills"
-    ])
+    bd["Projects"] = (min(15, len(d["projects"]) * 5) if d["projects"] else 0, 15)
+    if len(d["projects"]) < 3: tips.append("Include at least 3 projects with tech stack and measurable outcomes.")
 
-    skill_score = (
-        min(18, technical_skills * 1.5)
-        + min(5, skill_categories * 1.25)
-        + (2 if data["skills"].get("Soft Skills") else 0)
-    )
-    breakdown["Skills"] = (round(min(skill_score, 25), 1), 25)
+    bd["Certifications"] = (round(min(5, len(d["certifications"]) * 1.5), 1) if d["certifications"] else 0, 5)
+    if not d["certifications"]: tips.append("Add relevant certifications or online courses.")
 
-    if technical_skills < 8:
-        tips.append("List at least 8–10 relevant technical skills, grouped by category.")
-    if not data["skills"].get("Soft Skills"):
-        tips.append("Add soft skills such as communication, teamwork and leadership.")
+    words = len(d["text"].split())
+    fmt = 10 if 250 <= words <= 900 else 6 if (150 <= words < 250 or 900 < words <= 1300) else 3
+    metrics = METRIC_RE.search(d["text"])
+    fmt = min(15, fmt + (2 if metrics else 0))
+    av = sum(1 for v in ATS_ACTION_VERBS if find_pattern(d["text"], v))
+    fmt = min(15, fmt + (3 if av >= 3 else 1 if av else 0))
+    bd["Formatting & Impact"] = (fmt, 15)
+    if not metrics: tips.append("Use measurable impact, for example: improved accuracy by 12%.")
+    if av < 3: tips.append("Start bullet points with strong action verbs such as built, developed or optimized.")
+    if words < 250: tips.append("Your CV looks short. Add more detail to projects, skills and achievements.")
+    if words > 900: tips.append("Your CV is long. Keep it concise, ideally 1–2 pages.")
 
-    # Education - 10
-    education_score = min(10, 4 + len(data["education"]) * 2) if data["education"] else 0
-    breakdown["Education"] = (education_score, 10)
+    total = max(0, min(100, round(sum(v for v, _ in bd.values()))))
+    return total, bd, tips
 
-    if not data["education"]:
-        tips.append("Add an Education section with degree, institution and year.")
-
-    # Experience - 20
-    experience_score = 0
-    if data["experience"]:
-        experience_score = min(
-            20,
-            8 + len(data["experience"]) * 1.2 + data["experience_years"] * 2,
-        )
-    breakdown["Experience"] = (round(experience_score, 1), 20)
-
-    if not data["experience"]:
-        tips.append("Add internships, training, freelance work or part-time experience.")
-
-    # Projects - 15
-    project_score = min(15, len(data["projects"]) * 5) if data["projects"] else 0
-    breakdown["Projects"] = (project_score, 15)
-
-    if len(data["projects"]) < 3:
-        tips.append("Include at least 3 projects with tech stack and measurable outcomes.")
-
-    # Certifications - 5
-    cert_score = min(5, len(data["certifications"]) * 1.5) if data["certifications"] else 0
-    breakdown["Certifications"] = (round(cert_score, 1), 5)
-
-    if not data["certifications"]:
-        tips.append("Add relevant certifications or online courses.")
-
-    # Formatting and impact - 15
-    words = len(data["text"].split())
-
-    if 250 <= words <= 900:
-        formatting = 10
-    elif 150 <= words < 250 or 900 < words <= 1300:
-        formatting = 6
-    else:
-        formatting = 3
-
-    metrics = METRIC_RE.search(data["text"])
-    formatting = min(15, formatting + (2 if metrics else 0))
-
-    action_verbs = sum(
-        1 for verb in ATS_ACTION_VERBS if find_pattern(data["text"], verb)
-    )
-    formatting = min(15, formatting + (3 if action_verbs >= 3 else 1 if action_verbs else 0))
-
-    breakdown["Formatting & Impact"] = (formatting, 15)
-
-    if not metrics:
-        tips.append("Use measurable impact, for example: improved accuracy by 12%.")
-    if action_verbs < 3:
-        tips.append("Start bullet points with strong action verbs such as built, developed or optimized.")
-    if words < 250:
-        tips.append("Your CV looks short. Add more detail to projects, skills and achievements.")
-    if words > 900:
-        tips.append("Your CV is long. Keep it concise, ideally 1–2 pages.")
-
-    total = round(sum(value for value, _ in breakdown.values()))
-    total = max(0, min(100, total))
-    return total, breakdown, tips
-
-
-def grade(score: int):
-    if score >= 80:
-        return "Excellent 🌟", "#16a34a"
-    if score >= 65:
-        return "Good 👍", "#2563eb"
-    if score >= 45:
-        return "Average ⚠️", "#d97706"
+def grade(score):
+    if score >= 80: return "Excellent 🌟", "#16a34a"
+    if score >= 65: return "Good 👍", "#2563eb"
+    if score >= 45: return "Average ⚠️", "#d97706"
     return "Needs Work ❌", "#dc2626"
 
-
-# ----------------------------------------------------------------------------
-# JOB MATCHING
-# ----------------------------------------------------------------------------
-def match_jobs(all_skills: list) -> list:
-    have = {skill.lower() for skill in all_skills}
+def match_jobs(all_skills):
+    have = {s.lower() for s in all_skills}
     rows = []
-
     for role, info in JOB_ROLES.items():
-        required = info["skills"]
-        matched = [skill for skill in required if skill in have]
-        missing = [skill for skill in required if skill not in have]
+        req = info["skills"]
+        matched = [s for s in req if s in have]
+        rows.append({"Role": role, "Match %": round(100 * len(matched) / len(req)), "Matched": matched,
+                     "Missing": [s for s in req if s not in matched], "Companies": info["companies"]})
+    return sorted(rows, key=lambda r: r["Match %"], reverse=True)
 
-        rows.append({
-            "Role": role,
-            "Match %": round(100 * len(matched) / len(required)),
-            "Matched": matched,
-            "Missing": missing,
-            "Companies": info["companies"],
-        })
-
-    return sorted(rows, key=lambda row: row["Match %"], reverse=True)
-
-
-# ----------------------------------------------------------------------------
-# JOB DESCRIPTION MATCHER
-# ----------------------------------------------------------------------------
-def extract_jd_skills(jd_text: str) -> list:
+def extract_jd_skills(jd):
     found = []
-
-    for category, skills in SKILLS_DB.items():
-        if category == "Soft Skills":
+    for cat, skills in SKILLS_DB.items():
+        if cat == "Soft Skills":
             continue
-        for skill in skills:
-            if skill in AMBIGUOUS:
-                continue  # single letters cause too many false positives in free text
-            if find_pattern(jd_text, skill):
-                canonical = "node.js" if skill == "nodejs" else skill
-                if canonical not in found:
-                    found.append(canonical)
-
+        for s in skills:
+            if s in AMBIGUOUS:
+                continue
+            if find_pattern(jd, s):
+                c = "node.js" if s == "nodejs" else s
+                if c not in found:
+                    found.append(c)
     return found
 
-
-def match_job_description(cv_text: str, jd_text: str) -> dict:
-    jd_skills = extract_jd_skills(jd_text)
-
+def match_job_description(cv, jd):
+    jd_skills = extract_jd_skills(jd)
     if not jd_skills:
-        return {
-            "jd_skills": [],
-            "matched": [],
-            "missing": [],
-            "match_percent": 0,
-            "priority": [],
-        }
+        return {"jd_skills": [], "matched": [], "missing": [], "match_percent": 0, "priority": []}
+    def in_cv(s):
+        if s == "node.js":
+            return bool(find_pattern(cv, "node.js") or find_pattern(cv, "nodejs"))
+        return bool(find_pattern(cv, s))
+    matched = [s for s in jd_skills if in_cv(s)]
+    missing = [s for s in jd_skills if s not in matched]
+    pr = sorted(missing, key=lambda s: (0 if s in ("python","sql","machine learning","javascript","aws") else 1, s))
+    return {"jd_skills": jd_skills, "matched": matched, "missing": missing, "match_percent": round(100 * len(matched) / len(jd_skills)), "priority": pr}
 
-    def in_cv(skill: str) -> bool:
-        if skill == "node.js":
-            return bool(find_pattern(cv_text, "node.js") or find_pattern(cv_text, "nodejs"))
-        return bool(find_pattern(cv_text, skill))
+def ats_checks(d):
+    t, words = d["text"], len(d["text"].split())
+    P = lambda ok: "Pass" if ok else "Warning"
+    return [
+        {"Check": "Contact details", "Status": P(d["email"] != "Not found" and d["phone"] != "Not found"), "Detail": "Email and phone should be clearly present."},
+        {"Check": "LinkedIn / GitHub", "Status": P(d["linkedin"] or d["github"]), "Detail": "Add professional profile links."},
+        {"Check": "Skills section", "Status": P(d["skills"]), "Detail": "Add a clearly labelled Technical Skills section."},
+        {"Check": "Education section", "Status": P(d["education"]), "Detail": "Add degree, institution and year."},
+        {"Check": "Projects section", "Status": P(len(d["projects"]) >= 2), "Detail": "Add at least 2–3 strong projects."},
+        {"Check": "Measurable achievements", "Status": P(METRIC_RE.search(t)), "Detail": "Use numbers, percentages or business impact."},
+        {"Check": "Action verbs", "Status": P(any(find_pattern(t, v) for v in ATS_ACTION_VERBS)), "Detail": "Use verbs such as developed, built, optimized and deployed."},
+        {"Check": "CV length", "Status": P(250 <= words <= 900), "Detail": f"Current word count: {words}. Ideal range: 250–900 words."},
+    ]
 
-    matched = [skill for skill in jd_skills if in_cv(skill)]
-    missing = [skill for skill in jd_skills if skill not in matched]
-    match_percent = round(100 * len(matched) / len(jd_skills))
-
-    priority = sorted(
-        missing,
-        key=lambda skill: (
-            0 if skill in ("python", "sql", "machine learning", "javascript", "aws") else 1,
-            skill,
-        ),
-    )
-
-    return {
-        "jd_skills": jd_skills,
-        "matched": matched,
-        "missing": missing,
-        "match_percent": match_percent,
-        "priority": priority,
-    }
-
-
-# ----------------------------------------------------------------------------
-# ATS CHECKS
-# ----------------------------------------------------------------------------
-def ats_checks(data: dict) -> list:
-    checks = []
-    text = data["text"]
-    words = len(text.split())
-
-    checks.append({
-        "Check": "Contact details",
-        "Status": "Pass" if data["email"] != "Not found" and data["phone"] != "Not found" else "Warning",
-        "Detail": "Email and phone should be clearly present.",
-    })
-    checks.append({
-        "Check": "LinkedIn / GitHub",
-        "Status": "Pass" if data["linkedin"] or data["github"] else "Warning",
-        "Detail": "Add professional profile links.",
-    })
-    checks.append({
-        "Check": "Skills section",
-        "Status": "Pass" if data["skills"] else "Warning",
-        "Detail": "Add a clearly labelled Technical Skills section.",
-    })
-    checks.append({
-        "Check": "Education section",
-        "Status": "Pass" if data["education"] else "Warning",
-        "Detail": "Add degree, institution and year.",
-    })
-    checks.append({
-        "Check": "Projects section",
-        "Status": "Pass" if len(data["projects"]) >= 2 else "Warning",
-        "Detail": "Add at least 2–3 strong projects.",
-    })
-    checks.append({
-        "Check": "Measurable achievements",
-        "Status": "Pass" if METRIC_RE.search(text) else "Warning",
-        "Detail": "Use numbers, percentages or business impact.",
-    })
-    checks.append({
-        "Check": "Action verbs",
-        "Status": "Pass" if any(find_pattern(text, verb) for verb in ATS_ACTION_VERBS) else "Warning",
-        "Detail": "Use verbs such as developed, built, optimized and deployed.",
-    })
-    checks.append({
-        "Check": "CV length",
-        "Status": "Pass" if 250 <= words <= 900 else "Warning",
-        "Detail": f"Current word count: {words}. Ideal range: 250–900 words.",
-    })
-
-    return checks
-
-
-# ----------------------------------------------------------------------------
-# PROJECT SUGGESTIONS
-# ----------------------------------------------------------------------------
-def suggest_projects(skills_by_category: dict) -> list:
-    ideas = []
-    seen = set()
-
-    ordered = sorted(
-        skills_by_category.items(),
-        key=lambda item: len(item[1]),
-        reverse=True,
-    )
-
-    for category, _ in ordered:
-        for idea in PROJECT_IDEAS.get(category, []):
+def suggest_projects(skills_by_cat):
+    ideas, seen = [], set()
+    for cat, _ in sorted(skills_by_cat.items(), key=lambda i: len(i[1]), reverse=True):
+        for idea in PROJECT_IDEAS.get(cat, []):
             if idea not in seen:
-                ideas.append((category, idea))
-                seen.add(idea)
-
+                ideas.append((cat, idea)); seen.add(idea)
     for idea in GENERIC_IDEAS:
         ideas.append(("General", idea))
-
     return ideas[:12]
 
+# ============================== PDF REPORT ==============================
+def pdf_safe(v):
+    return str(v).encode("cp1252", "ignore").decode("cp1252")
 
-# ----------------------------------------------------------------------------
-# PDF REPORT
-# ----------------------------------------------------------------------------
-def pdf_safe(value) -> str:
-    """Drop characters the built-in PDF fonts cannot draw (emoji, etc.)."""
-    return str(value).encode("cp1252", "ignore").decode("cp1252")
-
-
-def build_pdf(data: dict, total: int, breakdown: dict, tips: list,
-              jobs: list, ideas: list, jd_result: dict = None) -> bytes:
+def build_pdf(data, total, breakdown, tips, jobs, ideas, jd_result=None):
     from reportlab.lib import colors
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
     from reportlab.lib.units import cm
     from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
-    buffer = io.BytesIO()
-    document = SimpleDocTemplate(
-        buffer,
-        pagesize=A4,
-        leftMargin=2 * cm,
-        rightMargin=2 * cm,
-        topMargin=1.8 * cm,
-        bottomMargin=1.8 * cm,
-    )
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=2*cm, rightMargin=2*cm, topMargin=1.8*cm, bottomMargin=1.8*cm)
+    ss = getSampleStyleSheet()
+    h1 = ParagraphStyle("h1x", parent=ss["Heading1"], textColor=colors.HexColor("#4f46e5"))
+    h2 = ParagraphStyle("h2x", parent=ss["Heading2"], textColor=colors.HexColor("#4f46e5"), spaceBefore=12)
+    body = ParagraphStyle("bodyx", parent=ss["BodyText"], wordWrap="CJK")
+    cell = ParagraphStyle("cellx", parent=body, fontSize=9, leading=11)
+    head = ParagraphStyle("headx", parent=cell, textColor=colors.white, fontName="Helvetica-Bold")
+    para = lambda v, s=body: Paragraph(escape(pdf_safe(v)), s)
 
-    styles = getSampleStyleSheet()
-    h1 = ParagraphStyle("h1x", parent=styles["Heading1"], textColor=colors.HexColor("#4f46e5"))
-    h2 = ParagraphStyle(
-        "h2x",
-        parent=styles["Heading2"],
-        textColor=colors.HexColor("#4f46e5"),
-        spaceBefore=12,
-    )
-    body = ParagraphStyle("bodyx", parent=styles["BodyText"], wordWrap="CJK")
-    cell_style = ParagraphStyle("cellx", parent=body, fontSize=9, leading=11)
-    head_style = ParagraphStyle(
-        "headx", parent=cell_style, textColor=colors.white, fontName="Helvetica-Bold"
-    )
-
-    def para(value, style=body):
-        return Paragraph(escape(pdf_safe(value)), style)
-
-    def make_table(rows, widths, header=True):
-        table = Table(rows, colWidths=widths, repeatRows=1 if header else 0)
-        style = [
-            ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#c7c7d9")),
-            ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ("ROWBACKGROUNDS", (0, 1 if header else 0), (-1, -1),
-             [colors.white, colors.HexColor("#f3f4fb")]),
-        ]
+    def table(rows, widths, header=True):
+        t = Table(rows, colWidths=widths, repeatRows=1 if header else 0)
+        st_ = [("GRID", (0,0), (-1,-1), 0.4, colors.HexColor("#c7c7d9")), ("VALIGN", (0,0), (-1,-1), "TOP"),
+               ("ROWBACKGROUNDS", (0, 1 if header else 0), (-1,-1), [colors.white, colors.HexColor("#f3f4fb")])]
         if header:
-            style.append(("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4f46e5")))
-        table.setStyle(TableStyle(style))
-        return table
+            st_.append(("BACKGROUND", (0,0), (-1,0), colors.HexColor("#4f46e5")))
+        t.setStyle(TableStyle(st_)); return t
 
-    story = [
-        Paragraph("CV Analysis Report", h1),
-        para(f"Generated on: {datetime.now().strftime('%d %b %Y')}"),
-        Spacer(1, 8),
-        make_table(
-            [
-                [para("Name", cell_style), para(data["name"], cell_style)],
-                [para("Email", cell_style), para(data["email"], cell_style)],
-                [para("Phone", cell_style), para(data["phone"], cell_style)],
-                [para("LinkedIn", cell_style), para(data["linkedin"] or "-", cell_style)],
-                [para("GitHub", cell_style), para(data["github"] or "-", cell_style)],
-            ],
-            [3.5 * cm, 13 * cm],
-            header=False,
-        ),
-    ]
-
-    grade_label, _ = grade(total)
-    score_rows = [[para("Category", head_style), para("Score", head_style), para("Max", head_style)]]
-    for key, (value, maximum) in breakdown.items():
-        score_rows.append([para(key, cell_style), para(value, cell_style), para(maximum, cell_style)])
-
-    story += [
-        Paragraph("Overall CV Score", h2),
-        para(f"{total} / 100 - {grade_label.strip()}"),
-        Spacer(1, 6),
-        make_table(score_rows, [9 * cm, 3 * cm, 3 * cm]),
-    ]
-
+    story = [Paragraph("CV Analysis Report", h1), para(f"Generated on: {datetime.now().strftime('%d %b %Y')}"), Spacer(1, 8),
+             table([[para(k, cell), para(v or "-", cell)] for k, v in
+                    [("Name", data["name"]), ("Email", data["email"]), ("Phone", data["phone"]), ("LinkedIn", data["linkedin"]), ("GitHub", data["github"])]],
+                   [3.5*cm, 13*cm], header=False)]
+    gl, _ = grade(total)
+    rows = [[para("Category", head), para("Score", head), para("Max", head)]]
+    for k, (v, m) in breakdown.items():
+        rows.append([para(k, cell), para(v, cell), para(m, cell)])
+    story += [Paragraph("Overall CV Score", h2), para(f"{total} / 100 - {gl.strip()}"), Spacer(1, 6), table(rows, [9*cm, 3*cm, 3*cm])]
     story.append(Paragraph("Skills", h2))
     if data["skills"]:
-        for category, items in data["skills"].items():
-            story.append(para(f"{category}: {', '.join(items)}"))
+        for c, items in data["skills"].items():
+            story.append(para(f"{c}: {', '.join(items)}"))
     else:
         story.append(para("No skills detected."))
-
-    for title, key in [
-        ("Education", "education"),
-        ("Experience", "experience"),
-        ("Projects", "projects"),
-        ("Certifications", "certifications"),
-    ]:
+    for title, key in [("Education","education"),("Experience","experience"),("Projects","projects"),("Certifications","certifications")]:
         story.append(Paragraph(title, h2))
         for line in data[key] or ["Not found"]:
             story.append(para("• " + line))
-
     story.append(Paragraph("Best Matching Job Roles", h2))
-    job_rows = [[para("Role", head_style), para("Match", head_style), para("Companies", head_style)]]
-    for job in jobs[:6]:
-        job_rows.append([
-            para(job["Role"], cell_style),
-            para(f"{job['Match %']}%", cell_style),
-            para(", ".join(job["Companies"][:6]), cell_style),
-        ])
-    story.append(make_table(job_rows, [5 * cm, 2 * cm, 9.5 * cm]))
-
+    jr = [[para("Role", head), para("Match", head), para("Companies", head)]]
+    for j in jobs[:6]:
+        jr.append([para(j["Role"], cell), para(f"{j['Match %']}%", cell), para(", ".join(j["Companies"][:6]), cell)])
+    story.append(table(jr, [5*cm, 2*cm, 9.5*cm]))
     if jd_result and jd_result.get("jd_skills"):
-        story.append(Paragraph("Job Description Match", h2))
-        story.append(para(f"JD Match Score: {jd_result['match_percent']}%"))
-        story.append(para("Matched skills: " + (", ".join(pretty(s) for s in jd_result["matched"]) or "-")))
-        story.append(para("Missing skills: " + (", ".join(pretty(s) for s in jd_result["missing"]) or "-")))
-
+        story += [Paragraph("Job Description Match", h2), para(f"JD Match Score: {jd_result['match_percent']}%"),
+                  para("Matched skills: " + (", ".join(pretty(s) for s in jd_result["matched"]) or "-")),
+                  para("Missing skills: " + (", ".join(pretty(s) for s in jd_result["missing"]) or "-"))]
     story.append(Paragraph("Suggested Project Topics", h2))
-    for category, idea in ideas:
-        story.append(para(f"• [{category}] {idea}"))
-
+    for c, idea in ideas:
+        story.append(para(f"• [{c}] {idea}"))
     story.append(Paragraph("Improvement Tips", h2))
-    for tip in tips or ["Great CV! Keep it updated."]:
-        story.append(para("• " + tip))
+    for t in tips or ["Great CV! Keep it updated."]:
+        story.append(para("• " + t))
+    doc.build(story)
+    return buf.getvalue()
 
-    document.build(story)
-    return buffer.getvalue()
+def txt_report(file_name, date, category, score, found, missing, tips=None):
+    r = f"""SMART CV ANALYZER - REPORT
+===========================
+File: {file_name}
+Date: {date}
+Best Matching Role: {category}
+CV Score: {score}/100
 
+Found Skills ({len(found)}):
+{', '.join(found) if found else 'None'}
 
-# ----------------------------------------------------------------------------
-# ANALYSIS PIPELINE
-# ----------------------------------------------------------------------------
+Skills to learn for best-match role ({len(missing)}):
+{', '.join(missing) if missing else 'None'}
+"""
+    if tips:
+        r += "\nImprovement Tips:\n- " + "\n- ".join(tips) + "\n"
+    return r
+
+# ============================== ANALYSIS PIPELINE ==============================
 @st.cache_data(show_spinner=False)
-def analyze(file_name: str, file_bytes: bytes):
+def analyze(file_name, file_bytes):
     text = read_cv(file_name, file_bytes)
-    sections = split_sections(text)
-
-    email = extract_email(text)
-    phone = extract_phone(text)
-    linkedin, github = extract_links(text)
-    experience = extract_experience(sections["experience"])
-
-    data = {
-        "text": text,
-        "name": extract_name(text, email),
-        "email": email,
-        "phone": phone,
-        "linkedin": linkedin,
-        "github": github,
-        "skills": extract_skills(text, "\n".join(sections["skills"])),
-        "education": extract_education(text, sections["education"]),
-        "experience": experience,
-        "experience_years": estimate_experience_years(text, experience),
-        "projects": extract_projects(sections["projects"]),
-        "certifications": extract_certifications(text, sections["certifications"]),
-    }
-
-    all_skills = []
+    sec = split_sections(text)
+    email, phone = extract_email(text), extract_phone(text)
+    li, gh = extract_links(text)
+    exp = extract_experience(sec["experience"])
+    data = {"text": text, "name": extract_name(text, email), "email": email, "phone": phone, "linkedin": li, "github": gh,
+            "skills": extract_skills(text, "\n".join(sec["skills"])), "education": extract_education(text, sec["education"]),
+            "experience": exp, "experience_years": estimate_experience_years(text, exp),
+            "projects": extract_projects(sec["projects"]), "certifications": extract_certifications(text, sec["certifications"])}
+    allk = []
     for items in data["skills"].values():
-        for skill in items:
-            if skill not in all_skills:
-                all_skills.append(skill)
-    data["all_skills"] = all_skills
+        for s in items:
+            if s not in allk:
+                allk.append(s)
+    data["all_skills"] = allk
+    total, bd, tips = calculate_score(data)
+    return data, total, bd, tips, match_jobs(allk), suggest_projects(data["skills"])
 
-    total, breakdown, tips = calculate_score(data)
-    jobs = match_jobs(data["all_skills"])
-    ideas = suggest_projects(data["skills"])
-
-    return data, total, breakdown, tips, jobs, ideas
-
-
-# ----------------------------------------------------------------------------
-# UI
-# ----------------------------------------------------------------------------
-with st.sidebar:
-    st.header("⚙️ Settings")
-    st.radio("Theme", ["Dark", "Light"], horizontal=True, key="theme")
-
-    st.divider()
-    st.header("📤 Upload CV")
-    uploaded_file = st.file_uploader("Upload your CV (PDF, DOCX, TXT ya Image)")
-    use_camera = st.checkbox("📷 Camera se CV ki photo lo")
-    camera_photo = (
-        st.camera_input("CV ki photo", label_visibility="collapsed") if use_camera else None
-    )
-    st.caption("Tip: text-based PDF best hai. Image/scanned CV ke liye OCR (Tesseract) chahiye.")
-
-    st.divider()
-    st.markdown(
-        "**Features**\n"
-        "- Premium dashboard\n"
-        "- Advanced CV parsing\n"
-        "- Editable extracted details\n"
-        "- Job Description Matcher\n"
-        "- ATS keyword checks\n"
-        "- Job roles and companies\n"
-        "- Project topic suggestions\n"
-        "- PDF report"
-    )
-
-if uploaded_file is None and camera_photo is not None:
-    uploaded_file = camera_photo
+# ============================== AUTH ==============================
+for k, v in {"logged_in": False, "user_id": None, "user_name": "", "user_email": ""}.items():
+    st.session_state.setdefault(k, v)
 
 st.markdown(get_css(st.session_state["theme"]), unsafe_allow_html=True)
 
-st.markdown(
-    """
-<div class="hero">
-    <h1>📄 CV Analyzer Pro</h1>
-    <p>Upload your CV, analyze it instantly, match it with job descriptions and download a professional improvement report.</p>
-</div>
-""",
-    unsafe_allow_html=True,
-)
+def login_page():
+    st.markdown('<div class="hero"><h1>📄 Smart CV Analyzer Pro</h1><p>AI resume screening — login to analyze, track and improve your CV.</p></div>', unsafe_allow_html=True)
+    _, mid, _ = st.columns([1, 2, 1])
+    with mid:
+        t1, t2, t3 = st.tabs(["🔐 Login", "📝 Sign Up", "🔑 Forgot Password"])
+        with t1:
+            e = st.text_input("Email", key="le"); p = st.text_input("Password", type="password", key="lp")
+            if st.button("Login", key="b_login"):
+                u = q("SELECT id,name,email FROM users WHERE email=? AND password_hash=?", (e.strip().lower(), hp(p)), one=True)
+                if u:
+                    st.session_state.update(logged_in=True, user_id=u[0], user_name=u[1], user_email=u[2]); st.rerun()
+                else:
+                    st.error("Invalid email or password.")
+        with t2:
+            n = st.text_input("Full Name", key="sn"); e2 = st.text_input("Email", key="se")
+            p1 = st.text_input("Password", type="password", key="sp1"); p2 = st.text_input("Confirm Password", type="password", key="sp2")
+            if st.button("Create Account", key="b_signup"):
+                e2 = e2.strip().lower()
+                if not (n.strip() and e2 and p1): st.error("Please fill all fields.")
+                elif not re.match(r"[^@\s]+@[^@\s]+\.[^@\s]+$", e2): st.error("Invalid email address.")
+                elif len(p1) < 6: st.error("Password must be at least 6 characters.")
+                elif p1 != p2: st.error("Passwords do not match.")
+                elif q("SELECT id FROM users WHERE email=?", (e2,), one=True): st.error("Email already registered.")
+                else:
+                    q("INSERT INTO users(name,email,password_hash,created_at) VALUES(?,?,?,?)", (n.strip(), e2, hp(p1), datetime.now().strftime("%Y-%m-%d")), commit=True)
+                    st.success("✅ Account created! Please log in.")
+        with t3:
+            e3 = st.text_input("Registered Email", key="fe"); np1 = st.text_input("New Password", type="password", key="fp1")
+            if st.button("Reset Password", key="b_reset"):
+                if not q("SELECT id FROM users WHERE email=?", (e3.strip().lower(),), one=True): st.error("Email not found.")
+                elif len(np1) < 6: st.error("Password must be at least 6 characters.")
+                else:
+                    q("UPDATE users SET password_hash=? WHERE email=?", (hp(np1), e3.strip().lower()), commit=True)
+                    st.success("✅ Password updated. You can log in now.")
 
-if not uploaded_file:
-    st.info("👈 Sidebar se apna CV upload karo — PDF, DOCX, TXT ya Image.")
-    st.stop()
+if not st.session_state.logged_in:
+    login_page(); footer(); st.stop()
 
-file_bytes = uploaded_file.getvalue()
+uid = st.session_state.user_id
 
-try:
-    with st.spinner("Analyzing your CV..."):
-        data, total, breakdown, tips, jobs, ideas = analyze(uploaded_file.name, file_bytes)
-except Exception as error:
-    st.error(f"CV read nahi ho paya: {error}")
-    st.stop()
+def logout():
+    for k in list(st.session_state.keys()):
+        if k != "theme":
+            del st.session_state[k]
+    st.session_state["logged_in"] = False
 
-if len(data["text"].strip()) < 50:
-    st.warning("CV se text extract nahi hua. Scanned/image CV ke liye pytesseract + Tesseract install karo, ya clear photo upload karo.")
-    st.stop()
-
-# ---- editable values: reset whenever a different file is uploaded ----------
-ED_KEYS = ["name", "email", "phone", "linkedin", "github",
-           "education", "experience", "projects", "certifications"]
-
-file_sig = f"{uploaded_file.name}:{len(file_bytes)}"
-if st.session_state.get("file_sig") != file_sig:
-    initial = {
-        "name": data["name"],
-        "email": data["email"],
-        "phone": data["phone"],
-        "linkedin": data["linkedin"] or "",
-        "github": data["github"] or "",
-        "education": "\n".join(data["education"]),
-        "experience": "\n".join(data["experience"]),
-        "projects": "\n".join(data["projects"]),
-        "certifications": "\n".join(data["certifications"]),
-    }
-    for key in ED_KEYS:
-        st.session_state["ed_" + key] = initial[key]
-    st.session_state.pop("jd_result", None)
-    st.session_state["file_sig"] = file_sig
-
-
-def ed_lines(key: str) -> list:
-    return [
-        line.strip()
-        for line in str(st.session_state.get("ed_" + key, "")).splitlines()
-        if line.strip()
-    ]
-
-
-label, color = grade(total)
-
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-    "📊 Dashboard",
-    "👤 Extracted Info",
-    "🧮 Score & ATS",
-    "💼 Jobs & Companies",
-    "🎯 JD Matcher",
-    "💡 Projects & Report",
-])
-
-# ----------------------------------------------------------------------------
-# DASHBOARD
-# ----------------------------------------------------------------------------
-with tab1:
-    col1, col2, col3, col4 = st.columns(4)
-
-    with col1:
-        st.markdown(
-            f'<div class="kpi"><div class="label">CV Score</div>'
-            f'<div class="value">{total}/100</div></div>',
-            unsafe_allow_html=True,
-        )
-    with col2:
-        st.markdown(
-            f'<div class="kpi"><div class="label">Skills Found</div>'
-            f'<div class="value">{len(data["all_skills"])}</div></div>',
-            unsafe_allow_html=True,
-        )
-    with col3:
-        st.markdown(
-            f'<div class="kpi"><div class="label">Projects</div>'
-            f'<div class="value">{len(data["projects"])}</div></div>',
-            unsafe_allow_html=True,
-        )
-    with col4:
-        st.markdown(
-            f'<div class="kpi"><div class="label">Experience</div>'
-            f'<div class="value">{data["experience_years"]} yrs</div></div>',
-            unsafe_allow_html=True,
-        )
-
-    left, right = st.columns([1, 1.2])
-
-    with left:
-        gauge = go.Figure(
-            go.Indicator(
-                mode="gauge+number",
-                value=total,
-                title={"text": label},
-                gauge={
-                    "axis": {"range": [0, 100]},
-                    "bar": {"color": color},
-                    "steps": [
-                        {"range": [0, 45], "color": "#fee2e2"},
-                        {"range": [45, 65], "color": "#fef3c7"},
-                        {"range": [65, 80], "color": "#dbeafe"},
-                        {"range": [80, 100], "color": "#dcfce7"},
-                    ],
-                },
-            )
-        )
-        gauge.update_layout(
-            height=340,
-            margin=dict(t=70, b=10, l=20, r=20),
-            paper_bgcolor="rgba(0,0,0,0)",
-            font_color=chart_font_color(),
-        )
-        show_chart(gauge)
-
-    with right:
-        categories = list(breakdown.keys())
-        percentages = [
-            round(100 * value / maximum) for value, maximum in breakdown.values()
-        ]
-
-        radar = go.Figure(
-            go.Scatterpolar(
-                r=percentages + percentages[:1],
-                theta=categories + categories[:1],
-                fill="toself",
-                line_color="#7c3aed",
-            )
-        )
-        radar.update_layout(
-            polar={"radialaxis": {"range": [0, 100]}},
-            height=340,
-            margin=dict(t=40, b=20, l=50, r=50),
-            showlegend=False,
-            paper_bgcolor="rgba(0,0,0,0)",
-            font_color=chart_font_color(),
-        )
-        show_chart(radar)
-
-    chart_left, chart_right = st.columns(2)
-
-    with chart_left:
-        if data["skills"]:
-            skill_df = pd.DataFrame({
-                "Category": list(data["skills"].keys()),
-                "Count": [len(items) for items in data["skills"].values()],
-            })
-            pie = px.pie(
-                skill_df,
-                names="Category",
-                values="Count",
-                hole=0.55,
-                title="Skills by Category",
-            )
-            pie.update_layout(
-                height=380,
-                paper_bgcolor="rgba(0,0,0,0)",
-                font_color=chart_font_color(),
-            )
-            show_chart(pie)
-        else:
-            st.info("Skills chart ke liye koi skill detect nahi hui.")
-
-    with chart_right:
-        job_df = pd.DataFrame(jobs[:8])[["Role", "Match %"]].sort_values("Match %")
-        bar = px.bar(
-            job_df,
-            x="Match %",
-            y="Role",
-            orientation="h",
-            range_x=[0, 100],
-            title="Top Job-Role Matches",
-        )
-        bar.update_layout(
-            height=380,
-            paper_bgcolor="rgba(0,0,0,0)",
-            font_color=chart_font_color(),
-        )
-        show_chart(bar)
-
-# ----------------------------------------------------------------------------
-# EXTRACTED INFO
-# ----------------------------------------------------------------------------
-with tab2:
-    st.subheader("✏️ Edit Extracted Details")
-    st.caption("Agar koi detail galat detect hui ho to yahan correct kar sakte ho.")
-
-    edit_col1, edit_col2, edit_col3 = st.columns(3)
-    with edit_col1:
-        st.text_input("Name", key="ed_name")
-    with edit_col2:
-        st.text_input("Email", key="ed_email")
-    with edit_col3:
-        st.text_input("Phone", key="ed_phone")
-
-    edit_col4, edit_col5 = st.columns(2)
-    with edit_col4:
-        st.text_input("LinkedIn URL", key="ed_linkedin")
-    with edit_col5:
-        st.text_input("GitHub URL", key="ed_github")
-
-    st.markdown('<div class="section-title">🎓 Education</div>', unsafe_allow_html=True)
-    st.text_area("Education", key="ed_education", height=130)
-
-    edit_col6, edit_col7 = st.columns(2)
-    with edit_col6:
-        st.markdown('<div class="section-title">💼 Experience</div>', unsafe_allow_html=True)
-        st.text_area("Experience", key="ed_experience", height=180)
-    with edit_col7:
-        st.markdown('<div class="section-title">🚀 Projects</div>', unsafe_allow_html=True)
-        st.text_area("Projects", key="ed_projects", height=180)
-
-    st.markdown('<div class="section-title">📜 Certifications</div>', unsafe_allow_html=True)
-    st.text_area("Certifications", key="ed_certifications", height=130)
-
+# ============================== SIDEBAR ==============================
+with st.sidebar:
+    st.success(f"👋 Welcome, {st.session_state.user_name}")
+    page = st.radio("Menu", ["🔍 Analyzer (New Scan)", "📚 History / My Resumes", "👤 Profile"], key="page")
+    st.radio("Theme", ["Dark", "Light"], horizontal=True, key="theme")
+    if st.button("🚪 Logout", key="b_logout"):
+        logout(); st.rerun()
     st.divider()
-    st.subheader("🧠 Detected Skills")
-    if data["skills"]:
-        for category, items in data["skills"].items():
-            st.markdown(f"**{category}**")
-            st.markdown(
-                "".join(f'<span class="chip">{escape(skill)}</span>' for skill in items),
-                unsafe_allow_html=True,
-            )
-    else:
-        st.warning("Koi skill detect nahi hui.")
 
-    with st.expander("📄 Raw Extracted Text"):
-        st.text(data["text"])
+# ============================== PAGE A: ANALYZER ==============================
+ED_KEYS = ["name", "email", "phone", "linkedin", "github", "education", "experience", "projects", "certifications"]
 
-# ----------------------------------------------------------------------------
-# SCORE AND ATS
-# ----------------------------------------------------------------------------
-with tab3:
-    st.subheader(f"Total CV Score: {total}/100 — {label}")
+def ed_lines(key):
+    return [l.strip() for l in str(st.session_state.get("ed_" + key, "")).splitlines() if l.strip()]
 
-    for category, (value, maximum) in breakdown.items():
-        st.write(f"**{category}** — {value}/{maximum}")
-        st.progress(max(0.0, min(1.0, float(value) / maximum)))
-
-    score_df = pd.DataFrame({
-        "Category": list(breakdown.keys()),
-        "Score": [value for value, _ in breakdown.values()],
-        "Max": [maximum for _, maximum in breakdown.values()],
-    })
-
-    score_chart = go.Figure()
-    score_chart.add_bar(
-        x=score_df["Category"],
-        y=score_df["Max"],
-        name="Maximum",
-        marker_color="#9ca3af",
-    )
-    score_chart.add_bar(
-        x=score_df["Category"],
-        y=score_df["Score"],
-        name="Your Score",
-        marker_color="#7c3aed",
-    )
-    score_chart.update_layout(
-        barmode="overlay",
-        title="Score Breakdown",
-        height=420,
-        paper_bgcolor="rgba(0,0,0,0)",
-        font_color=chart_font_color(),
-    )
-    show_chart(score_chart)
-
-    st.divider()
-    st.subheader("🤖 ATS-style Checks")
-
-    for row in ats_checks(data):
-        if row["Status"] == "Pass":
-            badge = '<span class="chip ok">PASS</span>'
+def page_analyzer():
+    with st.sidebar:
+        st.header("📤 Input")
+        mode = st.radio("Input type", ["Upload File", "Camera", "Paste Text"], key="mode")
+        name, fbytes = None, None
+        if mode == "Upload File":
+            f = st.file_uploader("PDF, DOCX, TXT or Image")
+            if f: name, fbytes = f.name, f.getvalue()
+        elif mode == "Camera":
+            cam = st.camera_input("Take a photo of your CV")
+            if cam: name, fbytes = "camera_photo.png", cam.getvalue()
         else:
-            badge = '<span class="chip miss">WARNING</span>'
+            txt = st.text_area("Paste resume text", height=200, key="paste_box")
+            if st.button("Analyze Text", key="b_paste"):
+                st.session_state["pasted"] = txt
+            if st.session_state.get("pasted", "").strip():
+                name, fbytes = "Pasted Text.txt", st.session_state["pasted"].encode("utf-8")
+        st.caption("Text-based PDF works best. Scanned/image CVs need Tesseract OCR.")
 
-        st.markdown(
-            f'<div class="card"><b>{escape(row["Check"])}</b> {badge}'
-            f'<div class="small">{escape(row["Detail"])}</div></div>',
-            unsafe_allow_html=True,
-        )
-
-    st.divider()
-    st.subheader("✅ Improvement Tips")
-    for tip in tips or ["Great CV! Keep it updated."]:
-        st.write("• " + tip)
-
-# ----------------------------------------------------------------------------
-# JOBS
-# ----------------------------------------------------------------------------
-with tab4:
-    st.subheader("💼 Best Matching Roles & Hiring Companies")
-
-    for index, job in enumerate(jobs[:8]):
-        with st.expander(
-            f"{job['Role']} — {job['Match %']}% match",
-            expanded=(index == 0),
-        ):
-            st.progress(max(0.0, min(1.0, job["Match %"] / 100)))
-            st.markdown("**Companies:** " + ", ".join(job["Companies"]))
-
-            st.markdown("**Matched skills:**")
-            if job["Matched"]:
-                st.markdown(
-                    "".join(
-                        f'<span class="chip ok">{escape(pretty(skill))}</span>'
-                        for skill in job["Matched"]
-                    ),
-                    unsafe_allow_html=True,
-                )
-            else:
-                st.write("—")
-
-            st.markdown("**Skills to learn:**")
-            if job["Missing"]:
-                st.markdown(
-                    "".join(
-                        f'<span class="chip miss">{escape(pretty(skill))}</span>'
-                        for skill in job["Missing"]
-                    ),
-                    unsafe_allow_html=True,
-                )
-            else:
-                st.write("—")
-
-# ----------------------------------------------------------------------------
-# JD MATCHER
-# ----------------------------------------------------------------------------
-with tab5:
-    st.subheader("🎯 Job Description Matcher")
-    st.caption("Job description paste karo. App CV skills se match percentage aur missing skills nikalega.")
-
-    jd_text = st.text_area(
-        "Paste Job Description",
-        height=280,
-        placeholder="Paste the full job description here...",
-        key="jd_text",
-    )
-
-    if st.button("🔍 Match CV with Job Description", type="primary"):
-        if not jd_text.strip():
-            st.warning("Pehle job description paste karo.")
-        else:
-            st.session_state["jd_result"] = match_job_description(data["text"], jd_text)
-
-    jd_result = st.session_state.get("jd_result")
-
-    if jd_result:
-        if not jd_result["jd_skills"]:
-            st.warning("Job description me koi known technical skill detect nahi hui.")
-        else:
-            score_col1, score_col2, score_col3 = st.columns(3)
-
-            with score_col1:
-                st.markdown(
-                    f'<div class="kpi"><div class="label">JD Match</div>'
-                    f'<div class="value">{jd_result["match_percent"]}%</div></div>',
-                    unsafe_allow_html=True,
-                )
-            with score_col2:
-                st.markdown(
-                    f'<div class="kpi"><div class="label">Matched Skills</div>'
-                    f'<div class="value">{len(jd_result["matched"])}</div></div>',
-                    unsafe_allow_html=True,
-                )
-            with score_col3:
-                st.markdown(
-                    f'<div class="kpi"><div class="label">Missing Skills</div>'
-                    f'<div class="value">{len(jd_result["missing"])}</div></div>',
-                    unsafe_allow_html=True,
-                )
-
-            st.progress(max(0.0, min(1.0, jd_result["match_percent"] / 100)))
-
-            st.markdown('<div class="section-title">✅ Matched Skills</div>', unsafe_allow_html=True)
-            if jd_result["matched"]:
-                st.markdown(
-                    "".join(
-                        f'<span class="chip ok">{escape(pretty(skill))}</span>'
-                        for skill in jd_result["matched"]
-                    ),
-                    unsafe_allow_html=True,
-                )
-            else:
-                st.write("—")
-
-            st.markdown(
-                '<div class="section-title">⚠️ Missing Skills — Priority Order</div>',
-                unsafe_allow_html=True,
-            )
-            if jd_result["priority"]:
-                for number, skill in enumerate(jd_result["priority"], start=1):
-                    st.markdown(
-                        f'<div class="card">{number}. <b>{escape(pretty(skill))}</b>'
-                        f' <span class="chip miss">Learn / Add</span></div>',
-                        unsafe_allow_html=True,
-                    )
-            else:
-                st.success("Excellent! CV me job description ke important skills already hain.")
-
-# ----------------------------------------------------------------------------
-# PROJECTS AND REPORT
-# ----------------------------------------------------------------------------
-with tab6:
-    st.subheader("💡 Suggested Project Topics")
-
-    for category, idea in ideas:
-        st.markdown(f"- **[{category}]** {idea}")
-
-    st.divider()
-    st.subheader("📥 Download Report")
-
-    editable_data = dict(data)
-    editable_data["name"] = st.session_state.get("ed_name") or data["name"]
-    editable_data["email"] = st.session_state.get("ed_email") or data["email"]
-    editable_data["phone"] = st.session_state.get("ed_phone") or data["phone"]
-    editable_data["linkedin"] = st.session_state.get("ed_linkedin") or None
-    editable_data["github"] = st.session_state.get("ed_github") or None
-    editable_data["education"] = ed_lines("education")
-    editable_data["experience"] = ed_lines("experience")
-    editable_data["projects"] = ed_lines("projects")
-    editable_data["certifications"] = ed_lines("certifications")
-
+    st.markdown('<div class="hero"><h1>📄 Smart CV Analyzer</h1><p>Upload your CV, analyze it instantly, match it with job descriptions and download a professional report.</p></div>', unsafe_allow_html=True)
+    if not fbytes:
+        st.info("👈 Choose a CV in the sidebar — PDF, DOCX, TXT, image, camera photo or pasted text.")
+        return
     try:
-        pdf_bytes = build_pdf(
-            editable_data,
-            total,
-            breakdown,
-            tips,
-            jobs,
-            ideas,
-            st.session_state.get("jd_result"),
-        )
+        with st.spinner("Analyzing your CV..."):
+            data, total, breakdown, tips, jobs, ideas = analyze(name, fbytes)
+    except Exception as e:
+        st.error(f"Could not read the CV: {e}"); return
+    if len(data["text"].strip()) < 50:
+        st.warning("Not enough text could be extracted. For scanned CVs install pytesseract + Tesseract, or upload a clearer file.")
+        return
 
-        safe_name = re.sub(r"[^A-Za-z0-9]+", "_", str(editable_data["name"])).strip("_") or "CV"
-        st.download_button(
-            "⬇️ Download PDF Report",
-            data=pdf_bytes,
-            file_name=f"CV_Report_{safe_name}.pdf",
-            mime="application/pdf",
-            type="primary",
-        )
-    except Exception as error:
-        st.error(f"PDF generate nahi hua: {error}")
+    sig = f"{name}:{len(fbytes)}:{hashlib.md5(fbytes).hexdigest()}"
+    if st.session_state.get("file_sig") != sig:
+        init = {"name": data["name"], "email": data["email"], "phone": data["phone"], "linkedin": data["linkedin"] or "",
+                "github": data["github"] or "", "education": "\n".join(data["education"]), "experience": "\n".join(data["experience"]),
+                "projects": "\n".join(data["projects"]), "certifications": "\n".join(data["certifications"])}
+        for k in ED_KEYS:
+            st.session_state["ed_" + k] = init[k]
+        st.session_state.pop("jd_result", None)
+        st.session_state["file_sig"] = sig
+    # ---- auto-save to history (once per file) ----
+    if st.session_state.get("saved_sig") != sig:
+        payload = {"data": data, "total": total, "breakdown": breakdown, "tips": tips, "jobs": jobs, "ideas": ideas}
+        top = jobs[0]
+        q("INSERT INTO resume_history(user_id,file_name,category,ats_score,found_skills,missing_skills,extracted_text,analysis_date,full_json) VALUES(?,?,?,?,?,?,?,?,?)",
+          (uid, name, top["Role"], total, json.dumps(data["all_skills"]), json.dumps([pretty(s) for s in top["Missing"]]),
+           data["text"], datetime.now().strftime("%Y-%m-%d %H:%M"), json.dumps(payload)), commit=True)
+        st.session_state["saved_sig"] = sig
+        st.session_state["just_saved"] = True
+    if st.session_state.pop("just_saved", False):
+        st.success("✅ Saved to History")
+
+    label, color = grade(total)
+    tabs = st.tabs(["📊 Dashboard", "👤 Extracted Info", "🧮 Score & ATS", "💼 Jobs & Companies", "🎯 JD Matcher", "💡 Projects & Report"])
+
+    with tabs[0]:
+        cols = st.columns(4)
+        for col, (lab, val) in zip(cols, [("CV Score", f"{total}/100"), ("Skills Found", len(data["all_skills"])), ("Projects", len(data["projects"])), ("Experience", f"{data['experience_years']} yrs")]):
+            col.markdown(kpi(lab, val), unsafe_allow_html=True)
+        l, r = st.columns([1, 1.2])
+        with l:
+            g = go.Figure(go.Indicator(mode="gauge+number", value=total, title={"text": label},
+                gauge={"axis": {"range": [0, 100]}, "bar": {"color": color}, "steps": [
+                    {"range": [0, 45], "color": "#fee2e2"}, {"range": [45, 65], "color": "#fef3c7"},
+                    {"range": [65, 80], "color": "#dbeafe"}, {"range": [80, 100], "color": "#dcfce7"}]}))
+            g.update_layout(height=340, margin=dict(t=70, b=10, l=20, r=20), paper_bgcolor="rgba(0,0,0,0)", font_color=chart_font_color())
+            show_chart(g)
+        with r:
+            cats = list(breakdown.keys()); pct = [round(100 * v / m) for v, m in breakdown.values()]
+            rd = go.Figure(go.Scatterpolar(r=pct + pct[:1], theta=cats + cats[:1], fill="toself", line_color="#7c3aed"))
+            rd.update_layout(polar={"radialaxis": {"range": [0, 100]}}, height=340, margin=dict(t=40, b=20, l=50, r=50), showlegend=False, paper_bgcolor="rgba(0,0,0,0)", font_color=chart_font_color())
+            show_chart(rd)
+        cl, cr = st.columns(2)
+        with cl:
+            if data["skills"]:
+                sdf = pd.DataFrame({"Category": list(data["skills"].keys()), "Count": [len(i) for i in data["skills"].values()]})
+                pie = px.pie(sdf, names="Category", values="Count", hole=0.55, title="Skills by Category")
+                pie.update_layout(height=380, paper_bgcolor="rgba(0,0,0,0)", font_color=chart_font_color())
+                show_chart(pie)
+            else:
+                st.info("No skills detected for the chart.")
+        with cr:
+            jdf = pd.DataFrame(jobs[:8])[["Role", "Match %"]].sort_values("Match %")
+            bar = px.bar(jdf, x="Match %", y="Role", orientation="h", range_x=[0, 100], title="Top Job-Role Matches")
+            bar.update_layout(height=380, paper_bgcolor="rgba(0,0,0,0)", font_color=chart_font_color())
+            show_chart(bar)
+
+    with tabs[1]:
+        st.subheader("✏️ Edit Extracted Details")
+        st.caption("Correct anything that was detected wrongly — the PDF report uses these values.")
+        c1, c2, c3 = st.columns(3)
+        c1.text_input("Name", key="ed_name"); c2.text_input("Email", key="ed_email"); c3.text_input("Phone", key="ed_phone")
+        c4, c5 = st.columns(2)
+        c4.text_input("LinkedIn URL", key="ed_linkedin"); c5.text_input("GitHub URL", key="ed_github")
+        st.markdown('<div class="section-title">🎓 Education</div>', unsafe_allow_html=True)
+        st.text_area("Education", key="ed_education", height=130, label_visibility="collapsed")
+        c6, c7 = st.columns(2)
+        with c6:
+            st.markdown('<div class="section-title">💼 Experience</div>', unsafe_allow_html=True)
+            st.text_area("Experience", key="ed_experience", height=180, label_visibility="collapsed")
+        with c7:
+            st.markdown('<div class="section-title">🚀 Projects</div>', unsafe_allow_html=True)
+            st.text_area("Projects", key="ed_projects", height=180, label_visibility="collapsed")
+        st.markdown('<div class="section-title">📜 Certifications</div>', unsafe_allow_html=True)
+        st.text_area("Certifications", key="ed_certifications", height=130, label_visibility="collapsed")
+        st.divider(); st.subheader("🧠 Detected Skills")
+        if data["skills"]:
+            for cat, items in data["skills"].items():
+                st.markdown(f"**{cat}**"); st.markdown(chips(items), unsafe_allow_html=True)
+        else:
+            st.warning("No skills detected.")
+        with st.expander("📄 View Extracted Text"):
+            st.text(data["text"])
+
+    with tabs[2]:
+        st.subheader(f"Total CV Score: {total}/100 — {label}")
+        for cat, (v, m) in breakdown.items():
+            st.write(f"**{cat}** — {v}/{m}"); st.progress(max(0.0, min(1.0, float(v) / m)))
+        sc = go.Figure()
+        sc.add_bar(x=list(breakdown.keys()), y=[m for _, m in breakdown.values()], name="Maximum", marker_color="#9ca3af")
+        sc.add_bar(x=list(breakdown.keys()), y=[v for v, _ in breakdown.values()], name="Your Score", marker_color="#7c3aed")
+        sc.update_layout(barmode="overlay", title="Score Breakdown", height=420, paper_bgcolor="rgba(0,0,0,0)", font_color=chart_font_color())
+        show_chart(sc)
+        st.divider(); st.subheader("🤖 ATS-style Checks")
+        for row in ats_checks(data):
+            badge = '<span class="chip ok">PASS</span>' if row["Status"] == "Pass" else '<span class="chip miss">WARNING</span>'
+            st.markdown(f'<div class="card"><b>{escape(row["Check"])}</b> {badge}<div class="small">{escape(row["Detail"])}</div></div>', unsafe_allow_html=True)
+        st.divider(); st.subheader("✅ Improvement Tips")
+        for t in tips or ["Great CV! Keep it updated."]:
+            st.write("• " + t)
+
+    with tabs[3]:
+        st.subheader("💼 Best Matching Roles & Hiring Companies")
+        for i, job in enumerate(jobs[:8]):
+            with st.expander(f"{job['Role']} — {job['Match %']}% match", expanded=(i == 0)):
+                st.progress(max(0.0, min(1.0, job["Match %"] / 100)))
+                st.markdown("**Companies:** " + ", ".join(job["Companies"]))
+                st.markdown("**Matched skills:**")
+                st.markdown(chips([pretty(s) for s in job["Matched"]], "ok") if job["Matched"] else "—", unsafe_allow_html=True)
+                st.markdown("**Skills to learn:**")
+                st.markdown(chips([pretty(s) for s in job["Missing"]], "miss") if job["Missing"] else "—", unsafe_allow_html=True)
+
+    with tabs[4]:
+        st.subheader("🎯 Job Description Matcher")
+        st.caption("Paste a job description to get a match percentage and prioritized missing skills.")
+        jd_text = st.text_area("Paste Job Description", height=260, placeholder="Paste the full job description here...", key="jd_text")
+        if st.button("🔍 Match CV with Job Description", type="primary", key="b_jd"):
+            if not jd_text.strip(): st.warning("Paste a job description first.")
+            else: st.session_state["jd_result"] = match_job_description(data["text"], jd_text)
+        jr = st.session_state.get("jd_result")
+        if jr:
+            if not jr["jd_skills"]:
+                st.warning("No known technical skills were found in the job description.")
+            else:
+                a, b, c = st.columns(3)
+                a.markdown(kpi("JD Match", f"{jr['match_percent']}%"), unsafe_allow_html=True)
+                b.markdown(kpi("Matched Skills", len(jr["matched"])), unsafe_allow_html=True)
+                c.markdown(kpi("Missing Skills", len(jr["missing"])), unsafe_allow_html=True)
+                st.progress(max(0.0, min(1.0, jr["match_percent"] / 100)))
+                st.markdown('<div class="section-title">✅ Matched Skills</div>', unsafe_allow_html=True)
+                st.markdown(chips([pretty(s) for s in jr["matched"]], "ok") if jr["matched"] else "—", unsafe_allow_html=True)
+                st.markdown('<div class="section-title">⚠️ Missing Skills — Priority Order</div>', unsafe_allow_html=True)
+                if jr["priority"]:
+                    for n, s in enumerate(jr["priority"], 1):
+                        st.markdown(f'<div class="card">{n}. <b>{escape(pretty(s))}</b> <span class="chip miss">Learn / Add</span></div>', unsafe_allow_html=True)
+                else:
+                    st.success("Excellent! Your CV already covers the important skills.")
+
+    with tabs[5]:
+        st.subheader("💡 Suggested Project Topics")
+        for cat, idea in ideas:
+            st.markdown(f"- **[{cat}]** {idea}")
+        st.divider(); st.subheader("📥 Download Report")
+        ed = dict(data)
+        ed["name"] = st.session_state.get("ed_name") or data["name"]
+        ed["email"] = st.session_state.get("ed_email") or data["email"]
+        ed["phone"] = st.session_state.get("ed_phone") or data["phone"]
+        ed["linkedin"] = st.session_state.get("ed_linkedin") or None
+        ed["github"] = st.session_state.get("ed_github") or None
+        for k in ("education", "experience", "projects", "certifications"):
+            ed[k] = ed_lines(k)
+        try:
+            pdf = build_pdf(ed, total, breakdown, tips, jobs, ideas, st.session_state.get("jd_result"))
+            safe = re.sub(r"[^A-Za-z0-9]+", "_", str(ed["name"])).strip("_") or "CV"
+            st.download_button("⬇️ Download PDF Report", data=pdf, file_name=f"CV_Report_{safe}.pdf", mime="application/pdf", type="primary")
+        except Exception as e:
+            st.error(f"Could not generate the PDF: {e}")
+        st.download_button("⬇️ Download TXT Report", txt_report(name, datetime.now().strftime("%Y-%m-%d %H:%M"), jobs[0]["Role"], total,
+                           data["all_skills"], [pretty(s) for s in jobs[0]["Missing"]], tips), file_name="cv_report.txt", key="dl_txt_now")
+
+# ============================== PAGE B: HISTORY ==============================
+def page_history():
+    st.markdown('<div class="hero"><h1>📚 History / My Resumes</h1><p>Every CV you analyze is saved here.</p></div>', unsafe_allow_html=True)
+    rows = q("SELECT id,analysis_date,file_name,category,ats_score,found_skills,missing_skills,extracted_text,full_json FROM resume_history WHERE user_id=?", (uid,))
+    df = pd.DataFrame(rows, columns=["ID", "Date", "File Name", "Category", "CV Score", "found", "missing", "text", "full"])
+    a, b, c = st.columns(3)
+    a.metric("📁 Total Scans", len(df))
+    b.metric("📊 Average Score", f"{df['CV Score'].mean():.1f}" if len(df) else "0")
+    c.metric("🏆 Best Category", df.groupby("Category")["CV Score"].mean().idxmax() if len(df) else "N/A")
+    if df.empty:
+        st.info("No resumes analyzed yet. Go to the Analyzer to start!"); return
+    s1, s2, s3 = st.columns([2, 1, 1])
+    search = s1.text_input("🔎 Search by file name or category")
+    cat = s2.selectbox("Category", ["All"] + sorted(df["Category"].dropna().unique().tolist()))
+    sort = s3.selectbox("Sort by", ["Date (Newest)", "Date (Oldest)", "Score (High)", "Score (Low)"])
+    if search:
+        df = df[df["File Name"].str.contains(search, case=False, na=False, regex=False) | df["Category"].str.contains(search, case=False, na=False, regex=False)]
+    if cat != "All":
+        df = df[df["Category"] == cat]
+    keys = {"Date (Newest)": ["Date", "ID"], "Date (Oldest)": ["Date", "ID"], "Score (High)": ["CV Score"], "Score (Low)": ["CV Score"]}[sort]
+    df = df.sort_values(keys, ascending=sort in ("Date (Oldest)", "Score (Low)"))
+    show_df(df[["Date", "File Name", "Category", "CV Score"]])
+    st.markdown("### 📂 Records")
+    for _, r in df.iterrows():
+        rid = int(r["ID"])
+        with st.expander(f"👁️ View Details — {r['File Name']} | {r['Category']} | {r['CV Score']} | {r['Date']}"):
+            try: found, missing = json.loads(r["found"] or "[]"), json.loads(r["missing"] or "[]")
+            except Exception: found, missing = [], []
+            st.progress(max(0.0, min(1.0, float(r["CV Score"] or 0) / 100)))
+            st.markdown("**Found skills**"); st.markdown(chips(found, "ok") if found else "None", unsafe_allow_html=True)
+            st.markdown("**Missing skills**"); st.markdown(chips(missing, "miss") if missing else "None", unsafe_allow_html=True)
+            st.text_area("Extracted Text", r["text"] or "", height=150, key=f"t{rid}", disabled=True)
+            payload = None
+            if r["full"]:
+                try: payload = json.loads(r["full"])
+                except Exception: payload = None
+            b1, b2, b3 = st.columns(3)
+            b1.download_button("⬇️ TXT Report", txt_report(r["File Name"], r["Date"], r["Category"], r["CV Score"], found, missing, payload["tips"] if payload else None), file_name=f"report_{rid}.txt", key=f"d{rid}")
+            if payload:
+                if b2.button("📄 Prepare PDF", key=f"p{rid}"):
+                    try:
+                        bd = {k: tuple(v) for k, v in payload["breakdown"].items()}
+                        ideas = [tuple(i) for i in payload["ideas"]]
+                        st.session_state[f"pdf{rid}"] = build_pdf(payload["data"], payload["total"], bd, payload["tips"], payload["jobs"], ideas)
+                    except Exception as e:
+                        st.error(f"PDF failed: {e}")
+                if f"pdf{rid}" in st.session_state:
+                    b2.download_button("⬇️ Download PDF", st.session_state[f"pdf{rid}"], file_name=f"CV_Report_{rid}.pdf", mime="application/pdf", key=f"dp{rid}")
+            if b3.button("🗑️ Delete", key=f"x{rid}"):
+                q("DELETE FROM resume_history WHERE id=? AND user_id=?", (rid, uid), commit=True)
+                st.session_state.pop("saved_sig", None); st.rerun()
+    st.markdown("---")
+    confirm = st.checkbox("I confirm I want to delete ALL my history", key="confirm_clear")
+    if st.button("🧹 Clear All History", key="b_clear"):
+        if confirm:
+            q("DELETE FROM resume_history WHERE user_id=?", (uid,), commit=True)
+            st.session_state.pop("saved_sig", None); st.rerun()
+        else:
+            st.warning("Tick the confirmation box first.")
+
+# ============================== PAGE C: PROFILE ==============================
+def page_profile():
+    st.markdown('<div class="hero"><h1>👤 Profile</h1><p>Manage your account.</p></div>', unsafe_allow_html=True)
+    since = q("SELECT created_at FROM users WHERE id=?", (uid,), one=True)
+    total = q("SELECT COUNT(*) FROM resume_history WHERE user_id=?", (uid,), one=True)[0]
+    c1, c2 = st.columns(2)
+    c1.metric("Name", st.session_state.user_name); c2.metric("Email", st.session_state.user_email)
+    c3, c4 = st.columns(2)
+    c3.metric("Resumes Analyzed", total); c4.metric("Member Since", since[0] if since and since[0] else "N/A")
+    st.markdown("### 🔒 Change Password")
+    old = st.text_input("Current Password", type="password", key="op")
+    n1 = st.text_input("New Password", type="password", key="n1"); n2 = st.text_input("Confirm New Password", type="password", key="n2")
+    if st.button("Update Password", key="b_pw"):
+        if not q("SELECT id FROM users WHERE id=? AND password_hash=?", (uid, hp(old)), one=True): st.error("Current password is incorrect.")
+        elif len(n1) < 6: st.error("New password must be at least 6 characters.")
+        elif n1 != n2: st.error("Passwords do not match.")
+        else:
+            q("UPDATE users SET password_hash=? WHERE id=?", (hp(n1), uid), commit=True); st.success("✅ Password updated.")
+    st.markdown("### ⚠️ Danger Zone")
+    ok = st.checkbox("I understand my account and all history will be permanently deleted", key="confirm_del")
+    if st.button("Delete Account", key="b_del"):
+        if ok:
+            q("DELETE FROM resume_history WHERE user_id=?", (uid,), commit=True)
+            q("DELETE FROM users WHERE id=?", (uid,), commit=True)
+            logout(); st.rerun()
+        else:
+            st.warning("Tick the confirmation box first.")
+
+# ============================== ROUTER ==============================
+if page.startswith("🔍"):
+    page_analyzer()
+elif page.startswith("📚"):
+    page_history()
+else:
+    page_profile()
+footer()
