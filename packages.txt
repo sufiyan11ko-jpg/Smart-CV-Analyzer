@@ -1,3 +1,14 @@
 tesseract-ocr
 tesseract-ocr-eng
 tesseract-ocr-hin
+streamlit
+pandas
+numpy
+scikit-learn
+pdfplumber
+python-docx
+pytesseract
+Pillow
+werkzeug
+reportlab
+plotly
