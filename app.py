@@ -514,10 +514,13 @@ PURPLE, PINK, GREY = "#6e56ff", "#ff5a8a", "#e5e7eb"
 
 
 def _plt():
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    return plt
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        return plt
+    except:
+        return None
 
 
 def _style(ax):
