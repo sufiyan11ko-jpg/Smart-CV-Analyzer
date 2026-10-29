@@ -1,770 +1,1520 @@
 """
-Smart CV Analyzer Pro
-Run:
-  python -m pip install -r requirements.txt
-  streamlit run app.py
-
-SQLite database is created automatically as resume_analyzer.db beside app.py.
-OCR for scanned PDFs/images requires the Tesseract application installed separately.
+CV Analyser - secure resume analysis app (Streamlit, single file)
+Login: email or mobile + password + OTP  |  OCR for scanned PDFs/images  |  SQLite  |  PDF reports
+Run: streamlit run app.py
 """
-from __future__ import annotations
-import io, re, os, json, sqlite3, hashlib, secrets, zipfile, tempfile
-from datetime import datetime
-from pathlib import Path
+import base64
+import hashlib
+import hmac
+import io
+import json
+import os
+import re
+import secrets
+import shutil
+import smtplib
+import sqlite3
+import urllib.parse
+import urllib.request
+import zipfile
+from datetime import datetime, timedelta
+from email.message import EmailMessage
 from xml.sax.saxutils import escape
 
-import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
 import streamlit as st
 
-APP_DIR = Path(__file__).resolve().parent
-DB_PATH = APP_DIR / "resume_analyzer.db"
-ADMIN_EMAIL = os.getenv("SCVA_ADMIN_EMAIL", "sufiyan@gmail.com").strip().lower()
-MAX_FILE_MB = 10
+st.set_page_config(page_title="CV Analyser", page_icon="📄", layout="centered", initial_sidebar_state="auto")
 
-st.set_page_config(page_title="Smart CV Analyzer Pro", page_icon="📄", layout="wide", initial_sidebar_state="expanded")
+# ============================== SETTINGS ==============================
+DB_FILE = "cv_analyser.db"
+OTP_TTL_MIN = 5            # OTP expires after 5 minutes
+OTP_MAX_ATTEMPTS = 5       # wrong OTP entries allowed per OTP
+OTP_COOLDOWN_SEC = 30      # minimum gap between two OTP requests
+OTP_MAX_PER_HOUR = 5       # OTP requests allowed per hour per account
+MAX_LOGIN_FAILS = 5        # wrong passwords before the account is locked
+LOCK_MIN = 10              # lock duration in minutes
+SESSION_DAYS = 3           # "stay logged in" after refresh
+PBKDF2_ITERS = 200_000
+MAX_OCR_PAGES = 10
 
-# ------------------------------ DATABASE ------------------------------
-def connect():
-    c = sqlite3.connect(DB_PATH, timeout=15)
-    c.row_factory = sqlite3.Row
-    c.execute("PRAGMA foreign_keys=ON")
-    return c
 
-def init_db():
-    with connect() as c:
-        c.execute("""CREATE TABLE IF NOT EXISTS users(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL, email TEXT NOT NULL UNIQUE,
-            password_hash TEXT NOT NULL, created_at TEXT NOT NULL)""")
-        c.execute("""CREATE TABLE IF NOT EXISTS resume_history(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            file_name TEXT NOT NULL, category TEXT, ats_score REAL NOT NULL,
-            found_skills TEXT, missing_skills TEXT, extracted_text TEXT,
-            analysis_date TEXT NOT NULL, full_json TEXT,
-            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE)""")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_history_user_date ON resume_history(user_id, analysis_date)")
-        cols = {r["name"] for r in c.execute("PRAGMA table_info(resume_history)")}
-        if "full_json" not in cols:
-            c.execute("ALTER TABLE resume_history ADD COLUMN full_json TEXT")
-
-def query(sql, args=(), one=False, commit=False):
-    with connect() as c:
-        cur = c.execute(sql, args)
-        result = cur.fetchone() if one else cur.fetchall()
-        if commit:
-            c.commit()
-        return result
-
-def password_hash(password: str, salt: str | None = None) -> str:
-    salt = salt or secrets.token_hex(16)
-    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt), 240_000).hex()
-    return f"pbkdf2_sha256${salt}${digest}"
-
-def verify_password(password: str, stored: str) -> bool:
+def cfg(name, default=""):
+    """Read a setting from environment variables or Streamlit secrets."""
+    v = os.environ.get(name)
+    if v:
+        return str(v)
     try:
-        scheme, salt, expected = stored.split("$", 2)
-        if scheme == "pbkdf2_sha256":
-            actual = password_hash(password, salt).split("$", 2)[2]
-            return secrets.compare_digest(actual, expected)
-        # Backward compatibility for older versions that used SHA-256.
-        if len(stored) == 64 and re.fullmatch(r"[a-f0-9]{64}", stored):
-            return secrets.compare_digest(hashlib.sha256(password.encode()).hexdigest(), stored)
+        v = st.secrets.get(name)
+        if v:
+            return str(v)
     except Exception:
         pass
-    return False
+    return default
+
+
+# ============================== KNOWLEDGE BASE ==============================
+INDUSTRIES = {
+    "IT & Software": {
+        "skills": ["python","java","c++","c#","c programming","javascript","typescript","html","css","react","angular","vue","node.js","django","flask","spring boot","sql","mysql","postgresql","mongodb","git","github","docker","kubernetes","aws","azure","linux","rest api","ci/cd","agile","scrum","junit","selenium","android","flutter","devops","responsive design","oop","data structures","algorithms"],
+        "roles": {
+            "Software Developer": ["python","java","javascript","git","sql","rest api","oop","data structures","agile"],
+            "Frontend Developer": ["html","css","javascript","react","typescript","git","responsive design","angular"],
+            "Backend Developer": ["python","java","node.js","django","flask","sql","mongodb","rest api","docker"],
+            "DevOps / Cloud Engineer": ["aws","azure","docker","kubernetes","linux","ci/cd","git","devops"],
+            "QA / Test Engineer": ["selenium","junit","sql","agile","python","java","git"]}},
+    "Data Science & AI": {
+        "skills": ["python","sql","machine learning","deep learning","nlp","computer vision","pandas","numpy","scikit-learn","tensorflow","pytorch","keras","statistics","data visualization","data analysis","power bi","tableau","excel","matplotlib","spark","hadoop","etl","feature engineering","llm","generative ai","jupyter","a/b testing","big data","data mining","regression"],
+        "roles": {
+            "Data Scientist": ["python","machine learning","pandas","numpy","scikit-learn","statistics","sql","deep learning"],
+            "Data Analyst": ["sql","excel","power bi","tableau","python","data analysis","data visualization","statistics"],
+            "ML / AI Engineer": ["python","tensorflow","pytorch","deep learning","nlp","computer vision","machine learning","llm"],
+            "BI Analyst": ["power bi","tableau","sql","excel","etl","data visualization","data analysis"]}},
+    "Finance & Accounting": {
+        "skills": ["accounting","bookkeeping","financial analysis","financial modeling","budgeting","forecasting","auditing","taxation","gst","tally","quickbooks","sap","excel","accounts payable","accounts receivable","reconciliation","financial reporting","risk management","valuation","investment analysis","ifrs","gaap","cost accounting","payroll","compliance","treasury"],
+        "roles": {
+            "Accountant": ["accounting","bookkeeping","tally","gst","reconciliation","accounts payable","accounts receivable","excel"],
+            "Financial Analyst": ["financial analysis","financial modeling","forecasting","budgeting","valuation","excel","financial reporting"],
+            "Auditor": ["auditing","compliance","risk management","ifrs","gaap","financial reporting"],
+            "Tax Consultant": ["taxation","gst","compliance","accounting","tally","financial reporting"]}},
+    "Marketing & Sales": {
+        "skills": ["seo","sem","content marketing","social media","google analytics","email marketing","copywriting","branding","ppc","market research","campaign management","google ads","facebook ads","crm","hubspot","lead generation","b2b sales","negotiation","cold calling","salesforce","a/b testing","public relations","influencer marketing","product marketing","business development"],
+        "roles": {
+            "Digital Marketer": ["seo","sem","social media","google analytics","email marketing","ppc","content marketing"],
+            "SEO / Content Specialist": ["seo","content marketing","copywriting","google analytics","social media"],
+            "Sales Executive": ["lead generation","negotiation","crm","b2b sales","cold calling","business development"],
+            "Brand Manager": ["branding","market research","campaign management","public relations","product marketing"]}},
+    "Human Resources": {
+        "skills": ["recruitment","talent acquisition","onboarding","employee relations","payroll","performance management","hris","training and development","compensation","interviewing","labor law","hr policies","employee engagement","conflict resolution","workforce planning","sourcing","hr analytics","applicant tracking","succession planning","diversity and inclusion"],
+        "roles": {
+            "HR Executive": ["recruitment","onboarding","hr policies","employee engagement","payroll","hris"],
+            "Recruiter / Talent Acquisition": ["recruitment","talent acquisition","sourcing","interviewing","applicant tracking"],
+            "HR Generalist": ["employee relations","performance management","labor law","hr policies","conflict resolution"],
+            "Payroll Specialist": ["payroll","compensation","hris","labor law","compliance"]}},
+    "Healthcare & Pharma": {
+        "skills": ["patient care","clinical research","nursing","diagnosis","pharmacology","medical coding","ehr","emr","hipaa","first aid","cpr","phlebotomy","radiology","surgery","public health","healthcare management","gmp","pharmacovigilance","medical devices","patient safety","telemedicine","anatomy","laboratory","clinical trials"],
+        "roles": {
+            "Clinical Research Associate": ["clinical research","clinical trials","gmp","pharmacovigilance","laboratory"],
+            "Registered Nurse": ["nursing","patient care","first aid","cpr","patient safety","emr"],
+            "Pharmacist": ["pharmacology","gmp","pharmacovigilance","patient care","medical devices"],
+            "Healthcare Administrator": ["healthcare management","ehr","hipaa","medical coding","public health"]}},
+    "Education & Training": {
+        "skills": ["curriculum development","lesson planning","classroom management","teaching","tutoring","e-learning","instructional design","assessment","student counselling","lms","moodle","training delivery","mentoring","public speaking","edtech","special education","academic writing","google classroom","pedagogy","research"],
+        "roles": {
+            "Teacher": ["teaching","lesson planning","classroom management","assessment","pedagogy","curriculum development"],
+            "Instructional Designer": ["instructional design","e-learning","lms","curriculum development","edtech"],
+            "Corporate Trainer": ["training delivery","public speaking","mentoring","assessment","e-learning"],
+            "Academic Counsellor": ["student counselling","mentoring","assessment","public speaking"]}},
+    "Engineering (Mech / Civil / Electrical)": {
+        "skills": ["autocad","solidworks","catia","ansys","matlab","plc","scada","cad","3d modeling","thermodynamics","hvac","structural analysis","staad pro","revit","estimation","surveying","circuit design","embedded systems","vlsi","robotics","iot","six sigma","lean manufacturing","quality control","project management","cnc","welding"],
+        "roles": {
+            "Mechanical Design Engineer": ["autocad","solidworks","catia","ansys","cad","3d modeling","thermodynamics"],
+            "Civil / Site Engineer": ["autocad","staad pro","revit","estimation","surveying","structural analysis","project management"],
+            "Electrical / Automation Engineer": ["plc","scada","circuit design","matlab","embedded systems","iot"],
+            "Manufacturing Engineer": ["lean manufacturing","six sigma","quality control","cnc","welding","project management"]}},
+    "Design & Creative": {
+        "skills": ["figma","adobe photoshop","adobe illustrator","adobe xd","indesign","after effects","premiere pro","ui/ux","wireframing","prototyping","typography","branding","graphic design","motion graphics","video editing","illustration","canva","sketch","user research","design systems","blender","photography","storyboarding","color theory"],
+        "roles": {
+            "UI/UX Designer": ["figma","ui/ux","wireframing","prototyping","user research","design systems","adobe xd"],
+            "Graphic Designer": ["adobe photoshop","adobe illustrator","indesign","typography","graphic design","branding","canva"],
+            "Video Editor": ["premiere pro","after effects","video editing","storyboarding","motion graphics"],
+            "Motion Designer": ["after effects","motion graphics","blender","illustration","storyboarding"]}},
+    "Operations & Supply Chain": {
+        "skills": ["supply chain","logistics","inventory management","procurement","vendor management","warehouse management","demand planning","erp","sap","lean","six sigma","process improvement","kpi","forecasting","quality control","project management","scheduling","shipping","import export","negotiation","mis reporting","operations management","supplier management","kaizen","5s"],
+        "roles": {
+            "Operations Manager": ["operations management","process improvement","kpi","project management","lean","six sigma"],
+            "Supply Chain Analyst": ["supply chain","demand planning","forecasting","inventory management","erp","sap"],
+            "Procurement Executive": ["procurement","vendor management","negotiation","supplier management","erp"],
+            "Logistics Coordinator": ["logistics","shipping","warehouse management","import export","scheduling","inventory management"]}},
+}
+SOFT_SKILLS = ["communication","leadership","teamwork","problem solving","time management","critical thinking","adaptability","creativity","collaboration","presentation","analytical skills","decision making","negotiation"]
+ALIASES = {r"\bnodejs\b": "node.js", r"\breact\.?js\b": "react", r"\bsklearn\b": "scikit-learn",
+           r"\b(?:ms|microsoft) excel\b": "excel", r"\bpowerbi\b": "power bi", r"\bphotoshop\b": "adobe photoshop",
+           r"\billustrator\b": "adobe illustrator", r"\bproblem-solving\b": "problem solving", r"\bteam work\b": "teamwork"}
+ACTION_VERBS = ["developed","designed","built","created","implemented","improved","optimized","automated","led","managed","analyzed","deployed","tested","reduced","increased","achieved","collaborated","integrated","maintained","researched","launched","delivered","coordinated"]
+METRIC_RE = re.compile(r"\d+\s?%|\d+\+|\$\s?\d+|₹\s?\d+")
+STOPWORDS = set("""the and for are with you your our will this that from have has had not but all any can who their they them its was were been being into over under about able more most such than then also etc per job role work team join looking candidate candidates years year plus must should would could may might shall including include includes using use used within across strong good great well new responsible responsibilities requirements required preferred skills skill ability experience""".split())
+
+# ============================== PARSING ==============================
+SECTION_ALIASES = {
+    "education": ["education","academic qualification","academic qualifications","academics","qualifications","academic background","educational qualification"],
+    "experience": ["experience","work experience","professional experience","employment history","internship","internships","work history","internship experience","training"],
+    "projects": ["projects","academic projects","personal projects","project work","key projects","major projects","project experience"],
+    "skills": ["skills","technical skills","key skills","core competencies","skills & tools","technical proficiency","it skills"],
+    "certifications": ["certifications","certificates","courses","training & certifications","certifications & courses"],
+    "other": ["summary","objective","career objective","profile","professional summary","achievements","awards","hobbies","interests","languages","references","declaration","personal details","extracurricular","activities"],
+}
+
+EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+PHONE_RE = re.compile(r"(?:\+?\d{1,3}[\s-]?)?(?:\(?\d{3,5}\)?[\s.-]?)?\d{3,5}[\s.-]?\d{4,5}")
+LINKEDIN_RE = re.compile(r"(?:https?://)?(?:www\.)?linkedin\.com/in/[\w\-%]+", re.I)
+GITHUB_RE = re.compile(r"(?:https?://)?(?:www\.)?github\.com/[\w\-]+", re.I)
+DEGREE_RE = re.compile(r"\b(b\.?\s?tech|m\.?\s?tech|b\.\s?e\.?|m\.\s?e\.?|bca|mca|bba|mba|b\.?\s?sc|m\.?\s?sc|b\.?\s?com|m\.?\s?com|b\.\s?a\.?|m\.\s?a\.?|ph\.?\s?d|diploma|bachelor|master|doctorate|12th|10th|hsc|ssc|intermediate|higher secondary|secondary|cbse|icse|polytechnic)\b", re.I)
+
+def extract_email(t):
+    m = EMAIL_RE.search(t); return m.group(0) if m else "Not found"
+
+def extract_phone(t):
+    for m in PHONE_RE.finditer(t):
+        d = re.sub(r"\D", "", m.group(0))
+        if 10 <= len(d) <= 13 and not re.fullmatch(r"(19|20)\d{2}(19|20)\d{2}", d):
+            return m.group(0).strip()
+    return "Not found"
+
+def extract_name(text, email):
+    skip = ("resume","curriculum","vitae","cv","profile","objective","summary","contact","address","email","phone","mobile","github","linkedin")
+    for line in [l.strip() for l in text.splitlines() if l.strip()][:15]:
+        if "@" in line or any(w in line.lower() for w in skip) or re.search(r"\d", line):
+            continue
+        words = re.sub(r"[^A-Za-z .'-]", " ", line).split()
+        if 2 <= len(words) <= 4 and all(w[0].isalpha() for w in words):
+            return " ".join(w.capitalize() if not w.isupper() else w for w in words)
+    if email != "Not found":
+        g = re.sub(r"[\d._-]+", " ", email.split("@")[0]).title().strip()
+        if g:
+            return g
+    return "Not found"
+
+def split_sections(text):
+    lookup = {a: k for k, al in SECTION_ALIASES.items() for a in al}
+    sections = {k: [] for k in SECTION_ALIASES}
+    cur = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        key = re.sub(r"[^a-z &]", "", line.lower()).strip()
+        if len(line) < 45 and key in lookup:
+            cur = lookup[key]; continue
+        if cur:
+            sections[cur].append(line)
+    return sections
+
+def find_pattern(text, pattern):
+    return re.search(r"(?<![A-Za-z0-9+#.])" + re.escape(pattern) + r"(?![A-Za-z0-9+#])", text or "", re.I)
+
+def extract_education(text, lines):
+    lines = lines[:] if lines else [l.strip() for l in text.splitlines() if DEGREE_RE.search(l)]
+    return [l for l in lines if len(l) > 3][:12]
+
+def extract_experience(lines):
+    return [l for l in lines if len(l) > 3][:15]
+
+def extract_projects(lines):
+    out = []
+    for line in lines:
+        c = line.strip()
+        if len(c) < 4:
+            continue
+        is_title = not c.startswith(("•", "-", "*", "●", "▪")) and len(c.split()) <= 14
+        if is_title or not out:
+            out.append(c.lstrip("•-*●▪ ").strip())
+    return out[:10]
+
+def extract_certifications(text, lines):
+    lines = lines[:] if lines else []
+    if not lines:
+        for l in text.splitlines():
+            if re.search(r"\b(certified|certification|certificate|course|specialization|nanodegree|bootcamp)\b", l, re.I):
+                lines.append(l.strip())
+    return [l.strip("•-*●▪ ") for l in lines if len(l.strip()) > 4][:12]
+
+def extract_links(text):
+    li, gh = LINKEDIN_RE.search(text), GITHUB_RE.search(text)
+    return (li.group(0) if li else None, gh.group(0) if gh else None)
+
+
+# ============================== OCR ==============================
+def _get_tesseract():
+    try:
+        import pytesseract
+    except ImportError as exc:
+        raise RuntimeError("OCR library missing. Run: pip install pytesseract pillow") from exc
+    if shutil.which("tesseract") is None:
+        for path in (r"C:\Program Files\Tesseract-OCR\tesseract.exe", r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+                     "/opt/homebrew/bin/tesseract", "/usr/local/bin/tesseract", "/usr/bin/tesseract"):
+            if os.path.exists(path):
+                pytesseract.pytesseract.tesseract_cmd = path
+                break
+    return pytesseract
+
+def _prepare_image(img):
+    from PIL import Image, ImageOps
+    try:
+        img = ImageOps.exif_transpose(img)
+    except Exception:
+        pass
+    if img.mode in ("RGBA", "LA", "P"):
+        rgba = img.convert("RGBA")
+        bg = Image.new("RGB", rgba.size, "white")
+        bg.paste(rgba, mask=rgba.split()[-1])
+        img = bg
+    img = ImageOps.autocontrast(img.convert("L"))
+    longest = max(img.size)
+    if longest < 2000:
+        s = 2000 / longest
+        img = img.resize((int(img.width * s), int(img.height * s)), Image.LANCZOS)
+    elif longest > 5000:
+        s = 5000 / longest
+        img = img.resize((int(img.width * s), int(img.height * s)), Image.LANCZOS)
+    return img
+
+def ocr_image(img):
+    pytesseract = _get_tesseract()
+    try:
+        prepared = _prepare_image(img)
+        try:
+            osd = pytesseract.image_to_osd(prepared, config="--psm 0")
+            m = re.search(r"Rotate:\s*(\d+)", osd)
+            if m and int(m.group(1)) % 360:
+                prepared = prepared.rotate(-int(m.group(1)), expand=True, fillcolor=255)
+        except Exception:
+            pass
+        try:
+            langs = set(pytesseract.get_languages(config=""))
+            lang = "eng+hin" if {"eng", "hin"} <= langs else "eng"
+        except Exception:
+            lang = "eng"
+        best = ""
+        for psm in (3, 6, 4):
+            t = pytesseract.image_to_string(prepared, lang=lang, config=f"--psm {psm}")
+            if len(t.strip()) > len(best.strip()):
+                best = t
+            if len(best.strip()) >= 200:
+                break
+        return best
+    except pytesseract.TesseractNotFoundError as exc:
+        raise RuntimeError("Tesseract OCR is not installed. Windows: UB-Mannheim installer | Linux: sudo apt install tesseract-ocr | Mac: brew install tesseract") from exc
+
+
+# ============================== FILE READING ==============================
+def detect_kind(file_name, b):
+    """Work out the real file type from its content, so a wrong extension does not break anything."""
+    lower = file_name.lower()
+    if b"%PDF-" in b[:1024]:
+        return "pdf"
+    if b[:4] == b"\xd0\xcf\x11\xe0":
+        raise RuntimeError("Old .doc files are not supported. Please save the file as DOCX or PDF.")
+    if b[:2] == b"PK":
+        try:
+            if "word/document.xml" in zipfile.ZipFile(io.BytesIO(b)).namelist():
+                return "docx"
+        except Exception:
+            pass
+        raise RuntimeError("Unsupported file type. Please upload PDF, DOCX, TXT, JPG or PNG.")
+    try:
+        from PIL import Image
+        Image.open(io.BytesIO(b)).verify()
+        return "image"
+    except Exception:
+        pass
+    if lower.endswith((".png", ".jpg", ".jpeg")):
+        raise RuntimeError("This image could not be opened (it may be corrupt).")
+    if lower.endswith((".pdf", ".docx")):
+        raise RuntimeError("This file looks damaged and could not be opened.")
+    if b"\x00" in b[:2000]:
+        raise RuntimeError("Unsupported file type. Please upload PDF, DOCX, TXT, JPG or PNG.")
+    return "txt"
+
+
+def extract_text(file_name, b):
+    """Return (text, ocr_used). Scanned PDFs and images are read with OCR."""
+    kind = detect_kind(file_name, b)
+    if kind == "txt":
+        return b.decode("utf-8", errors="ignore"), False
+    if kind == "docx":
+        import docx
+        d = docx.Document(io.BytesIO(b))
+        parts = [p.text for p in d.paragraphs]
+        for tb in d.tables:
+            for row in tb.rows:
+                parts.append(" | ".join(c.text for c in row.cells))
+        return "\n".join(parts), False
+    if kind == "image":
+        from PIL import Image
+        return ocr_image(Image.open(io.BytesIO(b))), True
+    import pdfplumber  # pdf
+    pages, used_ocr, ocr_error = [], False, None
+    with pdfplumber.open(io.BytesIO(b)) as pdf:
+        for i, page in enumerate(pdf.pages):
+            try:
+                t = page.extract_text() or ""
+            except Exception:
+                t = ""
+            if len(t.strip()) < 30 and i < MAX_OCR_PAGES:  # scanned page -> OCR
+                try:
+                    t = ocr_image(page.to_image(resolution=200).original)
+                    used_ocr = True
+                except RuntimeError as exc:
+                    ocr_error = str(exc)
+                except Exception:
+                    pass
+            pages.append(t)
+    text = "\n".join(pages)
+    if len(text.strip()) < 50 and ocr_error:
+        raise RuntimeError(ocr_error)
+    return text, used_ocr
+
+
+# ============================== ANALYSIS ==============================
+def norm_text(t):
+    t = (t or "").lower()
+    for pat, rep in ALIASES.items():
+        t = re.sub(pat, rep, t)
+    return t
+
+
+def keywords(text):
+    return {w for w in re.findall(r"[a-z0-9+#]{4,}", (text or "").lower()) if w not in STOPWORDS and not w.isdigit()}
+
+
+EDU_LEVELS = [
+    ("PhD / Doctorate", r"\b(ph\.?\s?d|doctorate)\b"),
+    ("Master's degree", r"\b(m\.?\s?tech|m\.\s?e\.?|mca|mba|m\.?\s?sc|m\.?\s?com|m\.\s?a\.?|master)\b"),
+    ("Bachelor's degree", r"\b(b\.?\s?tech|b\.\s?e\.?|bca|bba|b\.?\s?sc|b\.?\s?com|b\.\s?a\.?|bachelor)\b"),
+    ("Diploma", r"\b(diploma|polytechnic)\b"),
+    ("12th / Higher Secondary", r"\b(12th|hsc|intermediate|higher secondary)\b"),
+    ("10th / Secondary", r"\b(10th|ssc|secondary|cbse|icse)\b"),
+]
+
+
+def highest_education(lines, text):
+    blob = " ".join(lines) if lines else text
+    for label, pat in EDU_LEVELS:
+        if re.search(pat, blob, re.I):
+            return label
+    return "Not found"
+
+
+def score_cv(d, hard, soft, n_ind):
+    bd, tips = {}, []
+    c = (3 if d["name"] != "Not found" else 0) + (3 if d["email"] != "Not found" else 0) + (2 if d["phone"] != "Not found" else 0) + (2 if d["linkedin"] or d["github"] else 0)
+    bd["Contact Info"] = [c, 10]
+    if not (d["linkedin"] or d["github"]): tips.append("Add your LinkedIn (and GitHub / portfolio) link in the header.")
+    if c < 8: tips.append("Keep your name, email and phone number clearly visible at the top.")
+    ss = min(18, hard * 1.2) + min(5, n_ind * 1.25) + (2 if soft else 0)
+    bd["Skills"] = [round(min(ss, 25), 1), 25]
+    if hard < 8: tips.append("List at least 8-10 relevant skills / tools, grouped under a 'Skills' heading.")
+    if not soft: tips.append("Add soft skills such as communication, teamwork and leadership.")
+    bd["Education"] = [min(10, 4 + len(d["education"]) * 2) if d["education"] else 0, 10]
+    if not d["education"]: tips.append("Add an Education section with degree, institute and year.")
+    es = min(20, 8 + len(d["experience"]) * 1.2 + d["experience_years"] * 2) if d["experience"] else 0
+    bd["Experience"] = [round(es, 1), 20]
+    if not d["experience"]: tips.append("Add internships, training, freelance or part-time work with dates.")
+    bd["Projects"] = [min(15, len(d["projects"]) * 5) if d["projects"] else 0, 15]
+    if len(d["projects"]) < 3: tips.append("Add at least 3 projects with the tools used and measurable results.")
+    bd["Certifications"] = [round(min(5, len(d["certifications"]) * 1.5), 1) if d["certifications"] else 0, 5]
+    if not d["certifications"]: tips.append("Add relevant certifications or online courses.")
+    words = len(d["text"].split())
+    fmt = 10 if 250 <= words <= 900 else 6 if (150 <= words < 250 or 900 < words <= 1300) else 3
+    metrics = METRIC_RE.search(d["text"])
+    fmt = min(15, fmt + (2 if metrics else 0))
+    av = sum(1 for v in ACTION_VERBS if find_pattern(d["text"], v))
+    fmt = min(15, fmt + (3 if av >= 3 else 1 if av else 0))
+    bd["Formatting & Impact"] = [fmt, 15]
+    if not metrics: tips.append("Show impact with numbers, e.g. 'improved accuracy by 12%'.")
+    if av < 3: tips.append("Start bullet points with action verbs like built, developed, optimized.")
+    if words < 250: tips.append("Your CV looks short - add more detail about projects and achievements.")
+    if words > 900: tips.append("Your CV is long - keep it concise (1-2 pages).")
+    total = max(0, min(100, round(sum(v for v, _ in bd.values()))))
+    return total, bd, tips
+
+
+def analyze_text(text, file_name="Pasted Text", jd="", ocr_used=False):
+    low = norm_text(text)
+    sec = split_sections(text)
+    email, phone = extract_email(text), extract_phone(text)
+    li, gh = extract_links(text)
+    exp_lines = extract_experience(sec["experience"])
+    d = {"text": text, "name": extract_name(text, email), "email": email, "phone": phone, "linkedin": li, "github": gh,
+         "education": extract_education(text, sec["education"]), "experience": exp_lines,
+         "experience_years": estimate_experience_years(text, exp_lines), "projects": extract_projects(sec["projects"]),
+         "certifications": extract_certifications(text, sec["certifications"])}
+
+    found_by_ind = {name: [s for s in info["skills"] if find_pattern(low, s)] for name, info in INDUSTRIES.items()}
+    ranked = sorted(found_by_ind.items(), key=lambda kv: len(kv[1]), reverse=True)
+    fits = [{"industry": n, "hits": len(f), "fit": min(100, len(f) * 10)} for n, f in ranked]
+    primary = ranked[0][0] if ranked and len(ranked[0][1]) > 0 else "General"
+    hard = []
+    for _, f in ranked:
+        for s in f:
+            if s not in hard:
+                hard.append(s)
+    soft = [s for s in SOFT_SKILLS if find_pattern(low, s)]
+    n_ind = len([1 for _, f in ranked if len(f) >= 2])
+
+    roles = []
+    for name, f in ranked[:3]:
+        if not f:
+            continue
+        for role, req in INDUSTRIES[name]["roles"].items():
+            matched = [s for s in req if find_pattern(low, s)]
+            roles.append({"role": role, "industry": name, "match": round(100 * len(matched) / len(req)),
+                          "matched": matched, "missing": [s for s in req if s not in matched]})
+    roles.sort(key=lambda r: r["match"], reverse=True)
+    roles = roles[:8]
+
+    jd_info = None
+    if jd.strip():
+        jl = norm_text(jd)
+        jd_skills = []
+        for info in INDUSTRIES.values():
+            for s in info["skills"]:
+                if s not in jd_skills and find_pattern(jl, s):
+                    jd_skills.append(s)
+        cv_kw, jd_kw = keywords(text), keywords(jd)
+        overlap = round(100 * len(cv_kw & jd_kw) / len(jd_kw)) if jd_kw else 0
+        matched = [s for s in jd_skills if find_pattern(low, s)]
+        percent = round(100 * len(matched) / len(jd_skills)) if jd_skills else min(92, overlap * 2)
+        jd_info = {"skills": jd_skills, "matched": matched, "missing": [s for s in jd_skills if s not in matched],
+                   "percent": percent, "keyword_overlap": overlap,
+                   "missing_keywords": sorted(jd_kw - cv_kw)[:15]}
+
+    total, breakdown, tips = score_cv(d, len(hard), soft, n_ind)
+    if roles and roles[0]["missing"]:
+        tips.insert(0, f"To fit '{roles[0]['role']}' better, add: " + ", ".join(roles[0]["missing"][:5]) + ".")
+    if jd_info and jd_info["missing"]:
+        tips.insert(0, "Add these skills from the job description: " + ", ".join(jd_info["missing"][:6]) + ".")
+    job_match = jd_info["percent"] if jd_info else (roles[0]["match"] if roles else 0)
+
+    return {
+        "file_name": file_name, "ocr_used": bool(ocr_used), "words": len(text.split()),
+        "contact": {"name": d["name"], "email": email, "phone": phone, "linkedin": li, "github": gh},
+        "industry": primary, "industry_fit": fits[:6], "skills": hard, "soft_skills": soft,
+        "education": d["education"], "highest_education": highest_education(d["education"], text),
+        "experience": exp_lines, "experience_years": d["experience_years"],
+        "certifications": d["certifications"], "projects": d["projects"],
+        "score": total, "breakdown": breakdown, "tips": tips, "roles": roles, "jd": jd_info,
+        "job_match": job_match, "created": datetime.now().strftime("%Y-%m-%d %H:%M"),
+    }
+
+
+def grade(score):
+    if score >= 80: return "Excellent", "#16a34a"
+    if score >= 65: return "Good", "#2563eb"
+    if score >= 45: return "Average", "#d97706"
+    return "Needs Work", "#dc2626"
+
+
+def report_txt(a):
+    c = a["contact"]
+    L = ["CV ANALYSER - REPORT", "=" * 30, f"File: {a['file_name']}", f"Date: {a['created']}", "",
+         f"Name: {c['name']}", f"Email: {c['email']}", f"Phone: {c['phone']}", "",
+         f"CV Score: {a['score']}/100 ({grade(a['score'])[0]})", f"Industry: {a['industry']}",
+         f"Job-match estimate: {a['job_match']}%", f"Highest education: {a['highest_education']}",
+         f"Experience: {a['experience_years']} years", "", "Skills: " + (", ".join(a["skills"]) or "None"),
+         "Soft skills: " + (", ".join(a["soft_skills"]) or "None"), "", "Score breakdown:"]
+    L += [f"  {k}: {v[0]}/{v[1]}" for k, v in a["breakdown"].items()]
+    L += ["", "Best matching roles:"] + [f"  - {r['role']} ({r['match']}%)" for r in a["roles"][:5]]
+    L += ["", "Improvement suggestions:"] + [f"  - {t}" for t in a["tips"]]
+    return "\n".join(L)
+
+
+# ============================== CHARTS (matplotlib, light theme) ==============================
+PURPLE, PINK, GREY = "#6e56ff", "#ff5a8a", "#e5e7eb"
+
+
+def _plt():
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    return plt
+
+
+def _style(ax):
+    ax.set_facecolor("white")
+    for s in ("top", "right"):
+        ax.spines[s].set_visible(False)
+    ax.tick_params(colors="#374151", labelsize=8)
+
+
+def chart_score(score):
+    plt = _plt()
+    fig, ax = plt.subplots(figsize=(3.4, 3.2), facecolor="white")
+    color = grade(score)[1]
+    ax.pie([max(score, 0.01), max(100 - score, 0.01)], colors=[color, GREY], startangle=90, counterclock=False,
+           wedgeprops=dict(width=0.28, edgecolor="white"))
+    ax.text(0, 0.05, str(score), ha="center", va="center", fontsize=26, fontweight="bold", color="#1f2937")
+    ax.text(0, -0.28, "out of 100", ha="center", va="center", fontsize=8, color="#6b7280")
+    ax.set_title("CV Score", fontsize=11, color="#1f2937")
+    return fig
+
+
+def _hbar(labels, values, title, xmax=100, color=PURPLE, fmt="{:.0f}%", height=None):
+    plt = _plt()
+    fig, ax = plt.subplots(figsize=(4.6, height or max(2.2, 0.42 * len(labels) + 0.9)), facecolor="white")
+    y = list(range(len(labels)))[::-1]
+    ax.barh(y, values, color=color, height=0.6)
+    ax.set_yticks(y)
+    ax.set_yticklabels(labels, fontsize=8, color="#374151")
+    ax.set_xlim(0, xmax * 1.18)
+    for yi, v in zip(y, values):
+        ax.text(v + xmax * 0.02, yi, fmt.format(v), va="center", fontsize=8, color="#374151")
+    ax.set_title(title, fontsize=11, color="#1f2937", loc="left")
+    _style(ax)
+    fig.tight_layout()
+    return fig
+
+
+def chart_breakdown(breakdown):
+    labels = list(breakdown.keys())
+    vals = [round(100 * v[0] / v[1]) for v in breakdown.values()]
+    return _hbar(labels, vals, "Score breakdown (% of maximum)")
+
+
+def chart_industry(fits):
+    fits = [f for f in fits if f["fit"] > 0] or fits[:1]
+    return _hbar([f["industry"][:26] for f in fits], [f["fit"] for f in fits], "Industry fit", color=PINK)
+
+
+def chart_roles(roles):
+    roles = roles[:6] or [{"role": "No role matched", "match": 0}]
+    return _hbar([r["role"][:28] for r in roles], [r["match"] for r in roles], "Role match")
+
+
+def chart_trend(dates, scores):
+    plt = _plt()
+    fig, ax = plt.subplots(figsize=(4.8, 2.6), facecolor="white")
+    xs = list(range(len(scores)))
+    ax.plot(xs, scores, marker="o", color=PURPLE, linewidth=2)
+    ax.fill_between(xs, scores, color=PURPLE, alpha=0.08)
+    ax.set_ylim(0, 105)
+    ax.set_xticks(xs if len(xs) <= 8 else xs[:: max(1, len(xs) // 8)])
+    ax.set_xticklabels([dates[i][5:10] for i in ax.get_xticks()], fontsize=7)
+    ax.set_title("CV score over time", fontsize=11, color="#1f2937", loc="left")
+    _style(ax)
+    fig.tight_layout()
+    return fig
+
+
+def fig_png(fig):
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=150, facecolor="white", bbox_inches="tight")
+    _plt().close(fig)
+    return buf.getvalue()
+
+
+# ============================== PDF REPORT ==============================
+def pdf_safe(v):
+    return str(v).encode("cp1252", "ignore").decode("cp1252")
+
+
+def build_report_pdf(a):
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import cm
+    from reportlab.platypus import Image, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=1.8*cm, rightMargin=1.8*cm, topMargin=1.6*cm, bottomMargin=1.6*cm,
+                            title="CV Analyser Report")
+    ss = getSampleStyleSheet()
+    h1 = ParagraphStyle("h1x", parent=ss["Heading1"], textColor=colors.HexColor("#6e56ff"))
+    h2 = ParagraphStyle("h2x", parent=ss["Heading2"], textColor=colors.HexColor("#6e56ff"), spaceBefore=10, spaceAfter=4)
+    body = ParagraphStyle("bodyx", parent=ss["BodyText"], wordWrap="CJK", fontSize=9.5, leading=13)
+    cell = ParagraphStyle("cellx", parent=body, fontSize=9, leading=11)
+    head = ParagraphStyle("headx", parent=cell, textColor=colors.white, fontName="Helvetica-Bold")
+    P = lambda v, s=body: Paragraph(escape(pdf_safe(v)), s)
+
+    def table(rows, widths, header=True):
+        t = Table(rows, colWidths=widths, repeatRows=1 if header else 0)
+        style = [("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#d1d5db")), ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                 ("ROWBACKGROUNDS", (0, 1 if header else 0), (-1, -1), [colors.white, colors.HexColor("#f5f3ff")])]
+        if header:
+            style.append(("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#6e56ff")))
+        t.setStyle(TableStyle(style))
+        return t
+
+    def bullets(items, empty="Not found"):
+        return [P("• " + x) for x in (items or [empty])]
+
+    c = a["contact"]
+    glabel, _ = grade(a["score"])
+    story = [Paragraph("CV Analyser - Analysis Report", h1), P(f"File: {a['file_name']}   |   Date: {a['created']}"), Spacer(1, 6),
+             table([[P("Name", cell), P(c["name"], cell)], [P("Email", cell), P(c["email"], cell)], [P("Phone", cell), P(c["phone"], cell)],
+                    [P("LinkedIn", cell), P(c["linkedin"] or "-", cell)], [P("GitHub", cell), P(c["github"] or "-", cell)],
+                    [P("Industry", cell), P(a["industry"], cell)], [P("Highest education", cell), P(a["highest_education"], cell)],
+                    [P("Experience", cell), P(f"{a['experience_years']} years", cell)]], [4*cm, 13.4*cm], header=False),
+             Paragraph("Scores", h2), P(f"CV score: {a['score']} / 100 ({glabel})   |   Job-match estimate: {a['job_match']}%")]
+    rows = [[P("Category", head), P("Score", head), P("Max", head)]] + [[P(k, cell), P(v[0], cell), P(v[1], cell)] for k, v in a["breakdown"].items()]
+    story += [Spacer(1, 4), table(rows, [9*cm, 3*cm, 3*cm])]
+    try:  # charts are a bonus - the report is still produced without them
+        story += [Spacer(1, 8), Image(io.BytesIO(fig_png(chart_score(a["score"]))), width=5.2*cm, height=5*cm),
+                  Image(io.BytesIO(fig_png(chart_breakdown(a["breakdown"]))), width=12*cm, height=5.6*cm),
+                  Image(io.BytesIO(fig_png(chart_industry(a["industry_fit"]))), width=12*cm, height=5.2*cm)]
+    except Exception:
+        pass
+    story += [Paragraph("Skills", h2), P("Detected: " + (", ".join(a["skills"]) or "None")), P("Soft skills: " + (", ".join(a["soft_skills"]) or "None")),
+              Paragraph("Education", h2)] + bullets(a["education"]) + [Paragraph("Experience", h2)] + bullets(a["experience"]) + \
+             [Paragraph("Certifications", h2)] + bullets(a["certifications"]) + [Paragraph("Projects", h2)] + bullets(a["projects"])
+    rrows = [[P("Role", head), P("Match", head), P("Missing skills", head)]] + [[P(r["role"], cell), P(f"{r['match']}%", cell), P(", ".join(r["missing"][:6]) or "-", cell)] for r in a["roles"][:6]]
+    story += [Paragraph("Best matching roles", h2), table(rrows, [6*cm, 2*cm, 9.4*cm]) if a["roles"] else P("No industry skills detected.")]
+    if a["jd"]:
+        j = a["jd"]
+        story += [Paragraph("Job description match", h2), P(f"Match: {j['percent']}%   |   Keyword overlap: {j['keyword_overlap']}%"),
+                  P("Matched skills: " + (", ".join(j["matched"]) or "-")), P("Missing skills: " + (", ".join(j["missing"]) or "-"))]
+    story += [Paragraph("Improvement suggestions", h2)] + bullets(a["tips"], "Great CV! Keep it updated.")
+    doc.build(story)
+    return buf.getvalue()
+
+
+def estimate_experience_years(text, exp_lines):
+    """Years of experience: explicit '5 years' phrases or the union of dated ranges (overlaps counted once)."""
+    years = [float(v) for v in re.findall(r"(\d+(?:\.\d+)?)\+?\s*(?:years?|yrs?)", text, re.I)]
+    best = max(years) if years and max(years) < 40 else 0.0
+    cy, spans = datetime.now().year, []
+    for s, e in re.findall(r"((?:19|20)\d{2})\s*(?:-|–|—|to)\s*((?:19|20)\d{2}|present|current)", "\n".join(exp_lines), re.I):
+        s, e = int(s), (cy if e.lower() in ("present", "current") else int(e))
+        if e >= s:
+            spans.append((s, e))
+    total, cur_s, cur_e = 0, None, None
+    for s, e in sorted(spans):
+        if cur_e is None or s > cur_e:
+            if cur_e is not None:
+                total += cur_e - cur_s
+            cur_s, cur_e = s, e
+        else:
+            cur_e = max(cur_e, e)
+    if cur_e is not None:
+        total += cur_e - cur_s
+    return round(min(max(best, total), 40.0), 1)
+
+
+# ============================== DATABASE ==============================
+def now_str():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def ts_after(**delta):
+    return (datetime.now() + timedelta(**delta)).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def q(sql, args=(), one=False, commit=False, lastrowid=False):
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        cur = conn.execute(sql, args)
+        out = cur.lastrowid if lastrowid else (cur.fetchone() if one else cur.fetchall())
+        if commit:
+            conn.commit()
+        return out
+    finally:
+        conn.close()
+
+
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, email TEXT UNIQUE, mobile TEXT UNIQUE,
+        password_hash TEXT NOT NULL, created_at TEXT, failed_attempts INTEGER DEFAULT 0, locked_until TEXT);
+    CREATE TABLE IF NOT EXISTS otps(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, purpose TEXT, salt TEXT, code_hash TEXT,
+        expires_at TEXT, attempts INTEGER DEFAULT 0, used INTEGER DEFAULT 0, created_at TEXT);
+    CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY, user_id INTEGER, created_at TEXT);
+    CREATE TABLE IF NOT EXISTS resume_history(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, file_name TEXT, industry TEXT,
+        cv_score REAL, job_match REAL, ocr_used INTEGER, analysis_json TEXT, extracted_text TEXT, created_at TEXT);
+    CREATE TABLE IF NOT EXISTS reports(id INTEGER PRIMARY KEY AUTOINCREMENT, history_id INTEGER, user_id INTEGER, file_name TEXT,
+        pdf BLOB, created_at TEXT);
+    CREATE INDEX IF NOT EXISTS idx_history_user ON resume_history(user_id);
+    CREATE INDEX IF NOT EXISTS idx_otps_user ON otps(user_id, purpose);
+    """)
+    conn.execute("DELETE FROM sessions WHERE created_at < ?", (ts_after(days=-SESSION_DAYS),))
+    conn.execute("DELETE FROM otps WHERE created_at < ?", (ts_after(days=-1),))
+    conn.commit()
+    conn.close()
+
 
 init_db()
 
-# ------------------------------ SKILL DATABASE ------------------------------
-SKILLS_DB = {
-    "Programming": ["python","java","c++","c#","javascript","typescript","kotlin","swift","php","ruby","scala","matlab","c","r","go","dart","bash","rust","kotlin"],
-    "Web & App Development": ["html","css","react","angular","vue","node.js","nodejs","express","django","flask","fastapi","spring boot","bootstrap","tailwind","next.js","rest api","streamlit","wordpress","jquery","android","flutter","react native","ios"],
-    "Data & AI": ["machine learning","deep learning","nlp","natural language processing","computer vision","pandas","numpy","scikit-learn","tensorflow","keras","pytorch","opencv","power bi","tableau","data analysis","data visualization","matplotlib","seaborn","excel","statistics","generative ai","llm","langchain","data science","artificial intelligence","pyspark","spark","data engineering"],
-    "Database": ["sql","mysql","postgresql","mongodb","sqlite","oracle","firebase","redis","nosql","microsoft sql server","database design"],
-    "Cloud & DevOps": ["aws","azure","gcp","docker","kubernetes","jenkins","ci/cd","linux","terraform","git","github","devops","github actions","ansible","cloud computing"],
-    "Mechanical & Automobile": ["autocad","solidworks","catia","ansys","thermodynamics","manufacturing","automobile engineering","cnc","hydraulics","mechanical design","3d printing","cad","cam"],
-    "Electrical & Electronics": ["electrical engineering","circuit design","pcb design","plc","scada","embedded systems","vlsi","power systems","wiring","arduino","raspberry pi","microcontrollers","electronics"],
-    "Civil & Architecture": ["autocad civil","revit","staad pro","structural analysis","construction management","surveying","estimation","architecture","3d modeling","bim","quantity surveying"],
-    "Medical & Healthcare": ["mbbs","nursing","pharmacy","anatomy","physiology","patient care","surgery","diagnosis","medical coding","lab technician","pharmacology","clinical research","healthcare"],
-    "Finance & Commerce": ["accounting","tally","gst","auditing","financial modeling","investment banking","stock market","ca","cfa","budgeting","taxation","banking","financial analysis","bookkeeping","quickbooks","accounts payable"],
-    "Business & Management": ["business management","project management","agile","scrum","operations management","supply chain","business analysis","entrepreneurship","hr management","recruitment","business development","microsoft project"],
-    "Marketing & Sales": ["digital marketing","seo","sem","social media marketing","content marketing","google analytics","sales","crm","branding","market research","advertising","email marketing","hubspot"],
-    "Education & Teaching": ["teaching","curriculum design","classroom management","lesson planning","educational psychology","communication","subject matter expert","e-learning","tutoring"],
-    "Hospitality & Tourism": ["hotel management","hospitality","cooking","culinary arts","food safety","front office","housekeeping","tourism management","event management","customer service","food and beverage"],
-    "Legal & Law": ["law","legal research","contract drafting","advocacy","corporate law","criminal law","civil law","legal writing","compliance","litigation"],
-    "Design & Creative": ["graphic design","photoshop","illustrator","figma","ui/ux","video editing","premiere pro","after effects","fashion design","interior design","animation","canva","adobe xd","typography"],
-    "Agriculture & Environment": ["agriculture","agronomy","horticulture","soil science","organic farming","environmental science","forestry","irrigation","pest control","sustainability"],
-    "Government & Defense": ["upsc","ssc","police","army","defense","public administration","government policies","law enforcement","disaster management"],
-    "Soft Skills": ["communication","leadership","teamwork","problem solving","time management","critical thinking","adaptability","creativity","collaboration","presentation","attention to detail","negotiation","customer service"]
-}
-AMBIGUOUS = {"c", "r", "go", "ca", "law", "sales", "sql"}
-LABELS = {"node.js":"Node.js","nodejs":"Node.js","next.js":"Next.js","ci/cd":"CI/CD","ui/ux":"UI/UX","power bi":"Power BI","rest api":"REST API","scikit-learn":"Scikit-learn","c++":"C++","c#":"C#","ios":"iOS","nosql":"NoSQL","mysql":"MySQL","postgresql":"PostgreSQL","mongodb":"MongoDB","javascript":"JavaScript","typescript":"TypeScript","tensorflow":"TensorFlow","pytorch":"PyTorch","opencv":"OpenCV","fastapi":"FastAPI","github":"GitHub","wordpress":"WordPress","jquery":"jQuery","langchain":"LangChain","sqlite":"SQLite","spring boot":"Spring Boot","react native":"React Native","aws":"AWS","gcp":"GCP","html":"HTML","css":"CSS","nlp":"NLP","llm":"LLM","seo":"SEO","gst":"GST","plc":"PLC","scada":"SCADA","mbbs":"MBBS","ca":"CA","cfa":"CFA"}
-def pretty(s):
-    x=s.lower()
-    return LABELS.get(x, x.upper() if len(x) <= 3 else x.title())
+# ============================== PASSWORDS ==============================
+DUMMY_HASH = "pbkdf2_sha256$200000$00112233445566778899aabbccddeeff$" + "9f35e85b6712643c09d1ab2287a0d0c9ad4262b3242b824d4abc7e1c79910a5c"
 
-SECTION_ALIASES = {
-    "education": ["education","academic qualification","academic qualifications","academics","qualifications","academic background","educational qualification"],
-    "experience": ["experience","work experience","professional experience","employment history","internship","internships","work history","internship experience","training","employment"],
-    "projects": ["projects","academic projects","personal projects","project work","key projects","major projects","project experience"],
-    "skills": ["skills","technical skills","key skills","core competencies","skills & tools","technical proficiency","it skills","areas of expertise"],
-    "certifications": ["certifications","certificates","courses","training & certifications","certifications & courses","licenses"],
-}
-ROLE_SKILLS = {
- "Data Analyst":["sql","excel","power bi","tableau","python","pandas","data analysis","data visualization","statistics"],
- "Data Scientist":["python","machine learning","pandas","numpy","scikit-learn","sql","statistics","deep learning","data visualization"],
- "AI / ML Engineer":["python","tensorflow","pytorch","deep learning","nlp","computer vision","machine learning","docker"],
- "Python / Backend Developer":["python","django","flask","fastapi","sql","postgresql","rest api","git","docker"],
- "Frontend Developer":["html","css","javascript","react","typescript","bootstrap","tailwind","git","figma"],
- "Full Stack Developer":["html","css","javascript","react","node.js","mongodb","express","sql","git","rest api"],
- "Java Developer":["java","spring boot","mysql","sql","rest api","git"],
- "DevOps / Cloud Engineer":["aws","azure","docker","kubernetes","linux","jenkins","ci/cd","terraform","git"],
- "Mobile Developer":["android","kotlin","java","flutter","dart","firebase","react native"],
- "Software Tester / QA":["selenium","jira","sql","java","python","git","testing"],
- "Mechanical Engineer":["autocad","solidworks","catia","ansys","mechanical design","manufacturing"],
- "Electrical Engineer":["electrical engineering","circuit design","plc","scada","embedded systems","power systems"],
- "Civil Engineer":["autocad civil","revit","staad pro","structural analysis","construction management","surveying"],
- "Accountant / Finance":["accounting","tally","gst","auditing","financial modeling","taxation","financial analysis"],
- "Digital Marketing":["digital marketing","seo","sem","social media marketing","content marketing","google analytics"],
- "UI/UX Designer":["figma","ui/ux","user research","prototyping","wireframing","graphic design"],
- "HR / Recruitment":["hr management","recruitment","communication","interviewing","business management"],
-}
-COMPANIES = ["TCS","Infosys","Accenture","Wipro","Capgemini","Cognizant","Deloitte","IBM","Microsoft","Amazon","Google","HCLTech","Tech Mahindra","Zoho","Freshworks"]
-PROJECT_IDEAS = {
- "Data & AI":["Resume–Job Description Matcher using NLP","Customer Churn Prediction Dashboard","Product Review Sentiment Analysis","Sales Forecasting Dashboard"],
- "Web & App Development":["Full-Stack Job Portal with Role-Based Login","Portfolio Website with Analytics","Personal Finance Tracker","Online Examination System"],
- "Programming":["Algorithm Visualizer","Code Plagiarism Detector","Task Automation Toolkit"],
- "Database":["Inventory Management with SQL Analytics","Hospital Management Database"],
- "Cloud & DevOps":["Dockerized Web App with CI/CD","Cloud Monitoring Dashboard"],
- "Mechanical & Automobile":["CAD Model and Stress Analysis","Vehicle Maintenance Prediction"],
- "Electrical & Electronics":["IoT Energy Monitoring System","Smart Home Automation"],
- "Civil & Architecture":["Building Cost Estimation Tool","3D Building Model with BIM"],
- "Finance & Commerce":["Personal Budget and GST Tracker","Financial KPI Dashboard"],
- "Marketing & Sales":["SEO Audit Dashboard","Campaign Performance Analytics"],
- "Design & Creative":["Mobile App UI Kit in Figma","Brand Identity and Design System"],
- "Medical & Healthcare":["Clinic Appointment Management","Healthcare Inventory Tracker"],
-}
-def pattern_for(skill):
-    aliases = {"node.js":r"node\.?js","nodejs":r"node\.?js","c++":r"c\+\+","c#":r"c\#","ci/cd":r"ci\s*/\s*cd","ui/ux":r"ui\s*/\s*ux"}
-    p=aliases.get(skill.lower(), re.escape(skill))
-    return re.compile(r"(?<![A-Za-z0-9+#.])"+p+r"(?![A-Za-z0-9+#])", re.I)
-def found_skills(text, skill_section=""):
-    found={}
-    for cat, skills in SKILLS_DB.items():
-        for s in skills:
-            hay=skill_section if s in AMBIGUOUS else text
-            if hay and pattern_for(s).search(hay):
-                found.setdefault(cat,[])
-                lab=pretty(s)
-                if lab not in found[cat]: found[cat].append(lab)
-    return found
-def split_sections(text):
-    lookup={a:k for k, aliases in SECTION_ALIASES.items() for a in aliases}
-    sections={k:[] for k in SECTION_ALIASES}
-    cur=None
-    for raw in text.splitlines():
-        line=raw.strip()
-        if not line: continue
-        key=re.sub(r"[^a-z &/]", "", line.lower()).strip()
-        if len(line)<55 and key in lookup:
-            cur=lookup[key]; continue
-        if cur: sections[cur].append(line)
-    return sections
 
-# ------------------------------ FILE EXTRACTION ------------------------------
-IMAGE_EXTS=(".png",".jpg",".jpeg",".jfif",".webp",".bmp",".tif",".tiff",".gif",".heic",".heif")
-TEXT_EXTS={".txt", ".md", ".markdown", ".csv", ".tsv", ".json", ".xml", ".html", ".htm", ".log", ".yaml", ".yml", ".ini", ".py", ".java", ".js", ".css", ".sql"}
-SUPPORTED_EXTS=["pdf","docx","doc","txt","rtf","md","csv","tsv","json","xml","html","htm","log","yaml","yml","ini","py","java","js","css","sql","pptx","xlsx","xlsm","odt","png","jpg","jpeg","jfif","webp","bmp","tif","tiff","gif"]
+def hash_password(pw):
+    salt = secrets.token_hex(16)
+    h = hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt), PBKDF2_ITERS).hex()
+    return f"pbkdf2_sha256${PBKDF2_ITERS}${salt}${h}"
 
-def _decode_text(raw):
-    for encoding in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
+
+def verify_password(pw, stored):
+    try:
+        _, iters, salt, h = stored.split("$")
+        calc = hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt), int(iters)).hex()
+        return hmac.compare_digest(calc, h)
+    except Exception:
+        return False
+
+
+def password_problem(pw):
+    if len(pw) < 8:
+        return "Password must be at least 8 characters."
+    if not re.search(r"[A-Za-z]", pw) or not re.search(r"\d", pw):
+        return "Password must contain both letters and numbers."
+    return None
+
+
+# ============================== USERS / IDENTIFIERS ==============================
+EMAIL_FULL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+USER_COLS = "id,name,email,mobile,password_hash,failed_attempts,locked_until"   # indexes 0..6
+
+
+def normalize_mobile(s):
+    d = re.sub(r"\D", "", s or "")
+    return d[-10:] if 10 <= len(d) <= 15 else None
+
+
+def identify(identifier):
+    s = (identifier or "").strip()
+    if "@" in s:
+        return ("email", s.lower()) if EMAIL_FULL.match(s) else (None, None)
+    m = normalize_mobile(s)
+    return ("mobile", m) if m else (None, None)
+
+
+def find_user(kind, value):
+    col = "email" if kind == "email" else "mobile"
+    return q(f"SELECT {USER_COLS} FROM users WHERE {col}=?", (value,), one=True)
+
+
+def mask_contact(u):
+    if u[2]:
+        name, dom = u[2].split("@", 1)
+        return name[:1] + "***@" + dom
+    return "******" + (u[3] or "")[-4:]
+
+
+# ============================== OTP ==============================
+def otp_hash(salt, code):
+    return hashlib.sha256((salt + code).encode()).hexdigest()
+
+
+def send_email(to, subject, body):
+    host, port = cfg("SMTP_HOST"), int(cfg("SMTP_PORT", "587"))
+    user, pw = cfg("SMTP_USER"), cfg("SMTP_PASSWORD")
+    m = EmailMessage()
+    m["Subject"], m["From"], m["To"] = subject, cfg("SMTP_FROM", user), to
+    m.set_content(body)
+    if port == 465:
+        with smtplib.SMTP_SSL(host, port, timeout=15) as s:
+            s.login(user, pw)
+            s.send_message(m)
+    else:
+        with smtplib.SMTP(host, port, timeout=15) as s:
+            s.starttls()
+            s.login(user, pw)
+            s.send_message(m)
+
+
+def send_sms(to_number, body):
+    sid, token, frm = cfg("TWILIO_SID"), cfg("TWILIO_TOKEN"), cfg("TWILIO_FROM")
+    url = f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json"
+    data = urllib.parse.urlencode({"To": to_number, "From": frm, "Body": body}).encode()
+    req = urllib.request.Request(url, data=data)
+    req.add_header("Authorization", "Basic " + base64.b64encode(f"{sid}:{token}".encode()).decode())
+    urllib.request.urlopen(req, timeout=15).read()
+
+
+def deliver_otp(u, code):
+    """Send the OTP by email or SMS. Returns 'email', 'sms' or 'demo' (OTP shown on screen)."""
+    text = f"Your CV Analyser OTP is {code}. It is valid for {OTP_TTL_MIN} minutes. Do not share it with anyone."
+    smtp_ok = bool(cfg("SMTP_HOST") and cfg("SMTP_USER") and cfg("SMTP_PASSWORD"))
+    sms_ok = bool(cfg("TWILIO_SID") and cfg("TWILIO_TOKEN") and cfg("TWILIO_FROM"))
+    if u[2] and smtp_ok:
+        send_email(u[2], "Your CV Analyser OTP", text)
+        return "email"
+    if u[3] and sms_ok:
+        send_sms(cfg("DEFAULT_COUNTRY_CODE", "+91") + u[3], text)
+        return "sms"
+    if cfg("OTP_DEMO_MODE", "1").lower() in ("0", "false", "no"):
+        raise RuntimeError("OTP delivery is not configured for this account.")
+    return "demo"
+
+
+def issue_otp(u, purpose):
+    """Create and send an OTP. Returns dict(ok, msg, mode, demo)."""
+    uid = u[0]
+    recent = q("SELECT created_at FROM otps WHERE user_id=? AND created_at>=? ORDER BY id DESC", (uid, ts_after(hours=-1)))
+    if len(recent) >= OTP_MAX_PER_HOUR:
+        return {"ok": False, "msg": "Too many OTP requests. Please try again after some time."}
+    if recent:
+        gap = (datetime.now() - datetime.strptime(recent[0][0], "%Y-%m-%d %H:%M:%S")).total_seconds()
+        if gap < OTP_COOLDOWN_SEC:
+            return {"ok": False, "msg": f"Please wait {int(OTP_COOLDOWN_SEC - gap) + 1}s before requesting another OTP."}
+    code = f"{secrets.randbelow(10 ** 6):06d}"
+    salt = secrets.token_hex(8)
+    q("UPDATE otps SET used=1 WHERE user_id=? AND purpose=? AND used=0", (uid, purpose), commit=True)
+    q("INSERT INTO otps(user_id,purpose,salt,code_hash,expires_at,created_at) VALUES(?,?,?,?,?,?)",
+      (uid, purpose, salt, otp_hash(salt, code), ts_after(minutes=OTP_TTL_MIN), now_str()), commit=True)
+    try:
+        mode = deliver_otp(u, code)
+    except Exception as exc:
+        q("UPDATE otps SET used=1 WHERE user_id=? AND purpose=? AND used=0", (uid, purpose), commit=True)
+        return {"ok": False, "msg": f"Could not send the OTP ({exc}). Please try again."}
+    return {"ok": True, "mode": mode, "demo": code if mode == "demo" else None}
+
+
+def verify_otp(uid, purpose, code):
+    row = q("SELECT id,salt,code_hash,expires_at,attempts FROM otps WHERE user_id=? AND purpose=? AND used=0 ORDER BY id DESC LIMIT 1", (uid, purpose), one=True)
+    if not row:
+        return False, "No active OTP. Please request a new one."
+    oid, salt, chash, exp, attempts = row
+    if exp < now_str():
+        q("UPDATE otps SET used=1 WHERE id=?", (oid,), commit=True)
+        return False, "This OTP has expired. Please request a new one."
+    if attempts >= OTP_MAX_ATTEMPTS:
+        q("UPDATE otps SET used=1 WHERE id=?", (oid,), commit=True)
+        return False, "Too many wrong attempts. Please request a new OTP."
+    if hmac.compare_digest(otp_hash(salt, (code or "").strip()), chash):
+        q("UPDATE otps SET used=1 WHERE id=?", (oid,), commit=True)
+        return True, ""
+    q("UPDATE otps SET attempts=attempts+1 WHERE id=?", (oid,), commit=True)
+    left = OTP_MAX_ATTEMPTS - attempts - 1
+    if left <= 0:
+        q("UPDATE otps SET used=1 WHERE id=?", (oid,), commit=True)
+        return False, "Wrong OTP. No attempts left - please request a new OTP."
+    return False, f"Wrong OTP. {left} attempt(s) left."
+
+
+# ============================== SESSIONS ==============================
+for _k, _v in {"logged_in": False, "user_id": None, "user_name": "", "user_email": ""}.items():
+    st.session_state.setdefault(_k, _v)
+
+
+def token_hash(t):
+    return hashlib.sha256(t.encode()).hexdigest()
+
+
+def create_session(uid):
+    """Keep the login across a browser refresh using a random token in the URL (?t=...)."""
+    token = secrets.token_urlsafe(24)
+    q("INSERT INTO sessions(token_hash,user_id,created_at) VALUES(?,?,?)", (token_hash(token), uid, now_str()), commit=True)
+    st.session_state["token"] = token
+    try:
+        st.query_params["t"] = token
+    except Exception:
+        pass
+
+
+def restore_session():
+    if st.session_state.get("logged_in"):
+        return
+    try:
+        token = st.query_params.get("t")
+    except Exception:
+        return
+    if isinstance(token, (list, tuple)):
+        token = token[0] if token else None
+    if not token:
+        return
+    row = q("SELECT u.id,u.name,u.email,u.mobile FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.created_at>=?",
+            (token_hash(token), ts_after(days=-SESSION_DAYS)), one=True)
+    if row:
+        st.session_state.update(logged_in=True, user_id=row[0], user_name=row[1], user_email=row[2] or row[3] or "", token=token)
+    else:
         try:
-            return raw.decode(encoding)
-        except UnicodeDecodeError:
-            continue
-    return raw.decode("utf-8", errors="replace")
+            st.query_params.clear()
+        except Exception:
+            pass
 
-def _html_to_text(value):
-    from html.parser import HTMLParser
-    class TextExtractor(HTMLParser):
-        def __init__(self):
-            super().__init__(); self.parts=[]; self.skip=0
-        def handle_starttag(self, tag, attrs):
-            if tag in ("script", "style", "noscript"): self.skip += 1
-            if tag in ("p","br","div","li","tr","h1","h2","h3","h4"): self.parts.append("\n")
-        def handle_endtag(self, tag):
-            if tag in ("script", "style", "noscript") and self.skip: self.skip -= 1
-            if tag in ("p","div","li","tr"): self.parts.append("\n")
-        def handle_data(self, data):
-            if not self.skip: self.parts.append(data)
-    parser=TextExtractor(); parser.feed(value)
-    return "\n".join(line.strip() for line in "".join(parser.parts).splitlines() if line.strip())
 
-def extract_text(filename, raw):
-    """Extract readable text from supported resume/document formats with actionable errors."""
-    low=Path(filename or "uploaded_file").name.lower()
-    ext=Path(low).suffix
-    if not raw:
-        raise ValueError("The uploaded file is empty. Choose a non-empty file and try again.")
-    if len(raw)>MAX_FILE_MB*1024*1024:
-        raise ValueError(f"File is larger than {MAX_FILE_MB} MB. Compress it or upload a smaller file.")
-    if ext==".pdf" or raw.startswith(b"%PDF"):
-        try:
-            import pdfplumber
-            with pdfplumber.open(io.BytesIO(raw)) as pdf:
-                if not pdf.pages: raise ValueError("This PDF contains no pages.")
-                texts=[page.extract_text(layout=False) or "" for page in pdf.pages[:40]]
-            text="\n".join(texts).strip()
-            if len(text)<40:
-                try:
-                    ocr=ocr_bytes(raw, "pdf")
-                    if len(ocr.strip())>len(text): text=ocr.strip()
-                except Exception as ocr_error:
-                    if not text:
-                        raise ValueError(_ocr_help(ocr_error, "scanned PDF")) from ocr_error
-            if not text:
-                raise ValueError("No readable text found in this PDF. It may be scanned, password-protected, blank, or image-only. Try a clearer PDF or install Tesseract OCR.")
-            return text
-        except ValueError:
-            raise
-        except Exception as e:
-            msg=str(e).lower()
-            if "password" in msg or "encrypt" in msg:
-                raise ValueError("This PDF appears to be password-protected. Remove the password and upload it again.") from e
-            raise ValueError(f"Could not read this PDF ({type(e).__name__}). Try opening it in a PDF reader and saving/exporting a fresh copy.") from e
-    if ext==".docx":
-        try:
-            import docx
-            d=docx.Document(io.BytesIO(raw)); parts=[p.text for p in d.paragraphs]
-            for table in d.tables:
-                for row in table.rows: parts.append(" | ".join(cell.text for cell in row.cells))
-            for section in d.sections:
-                for p in section.header.paragraphs + section.footer.paragraphs:
-                    if p.text.strip(): parts.append(p.text)
-            text="\n".join(parts).strip()
-            if not text: raise ValueError("The DOCX file opened but contains no extractable text. Check whether it contains only images or is blank.")
-            return text
-        except ValueError: raise
-        except Exception as e: raise ValueError("Could not read this DOCX. Open it in Word/LibreOffice and use Save As → .docx, then upload again.") from e
-    if ext==".doc":
-        import shutil, subprocess, tempfile
-        antiword=shutil.which("antiword")
-        if antiword:
-            with tempfile.NamedTemporaryFile(suffix=".doc", delete=False) as f: f.write(raw); temp=f.name
-            try:
-                proc=subprocess.run([antiword,temp],capture_output=True,text=True,timeout=20)
-                if proc.returncode==0 and proc.stdout.strip(): return proc.stdout.strip()
-                raise ValueError("Legacy DOC extraction failed. Open the file in Word/LibreOffice and save it as DOCX.")
-            finally:
-                try: os.unlink(temp)
-                except OSError: pass
-        raise ValueError("Legacy .doc files need the antiword system package, which may not be installed on this server. Open the file in Word/LibreOffice and save as .docx, then upload again.")
-    if ext==".pptx":
-        try:
-            from pptx import Presentation
-            prs=Presentation(io.BytesIO(raw)); parts=[]
-            for i,slide in enumerate(prs.slides,1):
-                parts.append(f"Slide {i}")
-                for shape in slide.shapes:
-                    if getattr(shape,"has_text_frame",False) and shape.text.strip(): parts.append(shape.text)
-                    if getattr(shape,"has_table",False):
-                        for row in shape.table.rows: parts.append(" | ".join(cell.text for cell in row.cells))
-            text="\n".join(parts).strip()
-            if not text: raise ValueError("No text found in this PowerPoint. It may contain only images; export slides to images or use OCR.")
-            return text
-        except ValueError: raise
-        except Exception as e: raise ValueError("Could not read PPTX. Re-save the presentation as .pptx and try again.") from e
-    if ext in (".xlsx", ".xlsm"):
-        try:
-            import openpyxl
-            wb=openpyxl.load_workbook(io.BytesIO(raw),read_only=True,data_only=True)
-            parts=[]
-            for ws in wb.worksheets:
-                parts.append(f"Sheet: {ws.title}")
-                for row in ws.iter_rows(values_only=True):
-                    vals=[str(v).strip() for v in row if v is not None and str(v).strip()]
-                    if vals: parts.append(" | ".join(vals))
-            wb.close(); text="\n".join(parts).strip()
-            if not text: raise ValueError("No non-empty cells found in this spreadsheet.")
-            return text
-        except ValueError: raise
-        except Exception as e: raise ValueError("Could not read Excel file. Try saving it as .xlsx and uploading again.") from e
-    if ext==".odt":
-        try:
-            from odf.opendocument import load
-            from odf import text as odf_text, teletype
-            with tempfile.NamedTemporaryFile(suffix=".odt") as f:
-                f.write(raw); f.flush(); doc=load(f.name)
-            return "\n".join(teletype.extractText(node) for node in doc.getElementsByType(odf_text.P))
-        except Exception as e: raise ValueError("Could not read ODT. Save the document as DOCX or TXT and try again.") from e
-    if ext==".rtf":
-        content=_decode_text(raw)
-        # Best-effort RTF text cleanup; Word/LibreOffice export to TXT is more reliable for complex files.
-        content=re.sub(r"\\'[0-9a-fA-F]{2}"," ",content)
-        content=re.sub(r"\\[a-zA-Z]+-?\d* ?|\\[^a-zA-Z]", " ", content)
-        content=content.replace("{"," ").replace("}"," ")
-        return re.sub(r"\s+"," ",content).strip()
-    if ext in IMAGE_EXTS:
-        try:
-            from PIL import Image
-            img=Image.open(io.BytesIO(raw))
-            return ocr_image(img)
-        except Exception as e: raise ValueError(_ocr_help(e, "image")) from e
-    if ext in TEXT_EXTS or not ext:
-        content=_decode_text(raw)
-        if ext in (".html", ".htm"): content=_html_to_text(content)
-        if ext in (".csv", ".tsv"):
-            # Keep table structure legible to the analyzer.
-            delim="\t" if ext==".tsv" else ","
-            try:
-                import csv
-                rows=csv.reader(io.StringIO(content),delimiter=delim)
-                content="\n".join(" | ".join(cell.strip() for cell in row if cell.strip()) for row in rows)
-            except Exception: pass
-        if not content.strip(): raise ValueError("This file contains no readable text.")
-        return content
-    raise ValueError(f"Unsupported format: {ext or 'unknown'}. Supported formats: PDF, DOCX, legacy DOC (if antiword is installed), TXT, RTF, Markdown, CSV/TSV, HTML, JSON/XML, PPTX, XLSX/XLSM, ODT, common images and source/text files.")
-
-def _ocr_help(error, kind="file"):
-    msg=str(error).lower()
-    if "tesseract" in msg or "not installed" in msg or "not found" in msg:
-        return f"OCR could not read this {kind} because Tesseract OCR is missing or not configured. Install Tesseract on the server, or upload a text-based PDF/DOCX instead. Details: {error}"
-    if "unsupported image" in msg or "cannot identify image" in msg:
-        return f"This {kind} image format is not readable by the installed image library. Convert it to PNG or JPG and retry. Details: {error}"
-    return f"OCR failed for this {kind}. Try a clearer, upright PNG/JPG or a text-based PDF. Details: {error}"
-
-def ocr_bytes(raw, kind="pdf"):
-    import pdfplumber
-    with pdfplumber.open(io.BytesIO(raw)) as pdf:
-        texts=[]
-        for page in pdf.pages[:10]:
-            texts.append(ocr_image(page.to_image(resolution=180).original))
-        return "\n".join(texts)
-
-def ocr_image(img):
-    import pytesseract
-    from PIL import ImageOps
-    img=ImageOps.exif_transpose(img)
-    if img.mode not in ("RGB", "L"): img=img.convert("RGB")
-    img=ImageOps.autocontrast(img.convert("L"))
-    if max(img.size)<1800:
-        scale=1800/max(img.size); img=img.resize((int(img.width*scale),int(img.height*scale)))
-    return pytesseract.image_to_string(img, lang="eng", config="--psm 6")
-
-# ------------------------------ ANALYSIS ------------------------------
-EMAIL_RE=re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
-PHONE_RE=re.compile(r"(?:\+?\d{1,3}[\s-]?)?(?:\(?\d{3,5}\)?[\s.-]?)?\d{3,5}[\s.-]?\d{4,5}")
-LINKEDIN_RE=re.compile(r"(?:https?://)?(?:www\.)?linkedin\.com/in/[\w\-%]+",re.I)
-GITHUB_RE=re.compile(r"(?:https?://)?(?:www\.)?github\.com/[\w\-]+",re.I)
-ACTION_VERBS=["developed","designed","built","created","implemented","improved","optimized","automated","led","managed","analyzed","deployed","tested","reduced","increased","achieved","collaborated","integrated","maintained","researched"]
-METRIC_RE=re.compile(r"\d+\s?%|\d+\+|\$\s?\d+|₹\s?\d+")
-DEGREE_RE=re.compile(r"\b(b\.?\s?tech|m\.?\s?tech|bca|mca|bba|mba|b\.?\s?sc|m\.?\s?sc|b\.?\s?com|m\.?\s?com|bachelor|master|doctorate|12th|10th|hsc|ssc|diploma|ph\.?\s?d|degree)\b",re.I)
-def get_name(text,email):
-    skip=("resume","curriculum","vitae","profile","objective","summary","contact","address","email","phone","mobile","github","linkedin")
-    for line in [x.strip() for x in text.splitlines() if x.strip()][:12]:
-        if "@" in line or any(x in line.lower() for x in skip) or re.search(r"\d",line): continue
-        words=re.sub(r"[^A-Za-z .'-]"," ",line).split()
-        if 2<=len(words)<=4: return " ".join(w.capitalize() for w in words)
-    if email!="Not found":
-        return re.sub(r"[\d._-]+"," ",email.split("@")[0]).title().strip() or "Not found"
-    return "Not found"
-def extract_phone(text):
-    for m in PHONE_RE.finditer(text):
-        digits=re.sub(r"\D","",m.group())
-        if 10<=len(digits)<=13: return m.group().strip()
-    return "Not found"
-def analyze_text(text):
-    sec=split_sections(text)
-    email_m=EMAIL_RE.search(text); email=email_m.group() if email_m else "Not found"
-    li=LINKEDIN_RE.search(text); gh=GITHUB_RE.search(text)
-    skills=found_skills(text,"\n".join(sec["skills"]))
-    education=sec["education"] or [x.strip() for x in text.splitlines() if DEGREE_RE.search(x)]
-    cert=sec["certifications"] or [x.strip() for x in text.splitlines() if re.search(r"\b(certified|certification|certificate|course|specialization|bootcamp)\b",x,re.I)]
-    exp=sec["experience"]
-    projects=sec["projects"]
-    allskills=list(dict.fromkeys(s for items in skills.values() for s in items))
-    words=len(text.split())
-    contact=(3 if get_name(text,email)!="Not found" else 0)+(3 if email!="Not found" else 0)+(2 if extract_phone(text)!="Not found" else 0)+(2 if li or gh else 0)
-    tech=sum(len(v) for k,v in skills.items() if k!="Soft Skills")
-    cats=sum(bool(v) for k,v in skills.items() if k!="Soft Skills")
-    skillscore=min(18,tech*1.5)+min(5,cats*1.25)+(2 if skills.get("Soft Skills") else 0)
-    fmt=10 if 250<=words<=900 else 6 if 150<=words<=1300 else 3
-    fmt=min(15,fmt+(2 if METRIC_RE.search(text) else 0)+(3 if sum(bool(re.search(r"\b"+v+r"\b",text,re.I)) for v in ACTION_VERBS)>=3 else 0))
-    breakdown={
-      "Contact Info":(contact,10),"Skills":(round(min(skillscore,25),1),25),
-      "Education":(min(10,4+len(education)*2) if education else 0,10),
-      "Experience":(min(20,8+len(exp)*1.2) if exp else 0,20),
-      "Projects":(min(15,len(projects)*5) if projects else 0,15),
-      "Certifications":(min(5,len(cert)*1.5) if cert else 0,5),
-      "Formatting & Impact":(fmt,15)}
-    score=round(sum(v for v,_ in breakdown.values()))
-    tips=[]
-    if not li and not gh: tips.append("Add a LinkedIn or GitHub profile link.")
-    if tech<8: tips.append("Add relevant technical or role-specific skills that you genuinely have.")
-    if not education: tips.append("Add your education, institution and graduation year.")
-    if not exp: tips.append("Include internships, training, freelance, volunteering or work experience if applicable.")
-    if len(projects)<2: tips.append("Add 2–3 projects with your role, tools used and results.")
-    if not cert: tips.append("Add relevant courses or certifications if you have them.")
-    if not METRIC_RE.search(text): tips.append("Quantify impact where truthful (e.g. time saved, users served, accuracy achieved).")
-    if words<250: tips.append("Your CV is short; add useful project and experience details.")
-    if words>900: tips.append("Keep the CV concise, usually 1–2 pages for an early-career applicant.")
-    roles=[]
-    have={x.lower() for x in allskills}
-    for role, req in ROLE_SKILLS.items():
-        matched=[s for s in req if pretty(s).lower() in have or s in have]
-        roles.append({"Role":role,"Match %":round(100*len(matched)/len(req)),"Matched":matched,"Missing":[s for s in req if s not in matched],"Companies":COMPANIES[:7]})
-    roles.sort(key=lambda x:x["Match %"],reverse=True)
-    return {"text":text,"name":get_name(text,email),"email":email,"phone":extract_phone(text),
-      "linkedin":li.group() if li else "","github":gh.group() if gh else "",
-      "skills":skills,"all_skills":allskills,"education":education[:15],"experience":exp[:20],
-      "projects":projects[:15],"certifications":cert[:15],"word_count":words,
-      "score":score,"breakdown":breakdown,"tips":tips,"jobs":roles}
-
-def jd_match(cv_text,jd_text):
-    jd_skills=[]
-    for cat,skills in SKILLS_DB.items():
-        if cat=="Soft Skills": continue
-        for s in skills:
-            if s in AMBIGUOUS: continue
-            if pattern_for(s).search(jd_text) and s not in jd_skills: jd_skills.append(s)
-    matched=[s for s in jd_skills if pattern_for(s).search(cv_text)]
-    missing=[s for s in jd_skills if s not in matched]
-    priority=sorted(missing,key=lambda s:(0 if s in {"python","sql","excel","machine learning","javascript","aws"} else 1,s))
-    return {"jd_skills":jd_skills,"matched":matched,"missing":missing,"priority":priority,"match_percent":round(100*len(matched)/len(jd_skills)) if jd_skills else 0}
-def grade(score):
-    if score>=80:return "Excellent 🌟"
-    if score>=65:return "Good 👍"
-    if score>=45:return "Average ⚠️"
-    return "Needs Work ❌"
-def project_ideas(skills):
-    cats=sorted(skills,key=lambda c:len(skills[c]),reverse=True)
-    out=[]
-    for cat in cats:
-        for idea in PROJECT_IDEAS.get(cat,[]):
-            if (cat,idea) not in out: out.append((cat,idea))
-    for idea in ["Portfolio Website with Blog","AI FAQ Chatbot","Weather and Air Quality Dashboard"]:
-        out.append(("General",idea))
-    return out[:12]
-def pdf_report(d):
-    from reportlab.lib import colors
-    from reportlab.lib.pagesizes import A4
-    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.lib.units import cm
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-    buf=io.BytesIO(); doc=SimpleDocTemplate(buf,pagesize=A4,leftMargin=1.6*cm,rightMargin=1.6*cm,topMargin=1.5*cm,bottomMargin=1.5*cm)
-    styles=getSampleStyleSheet()
-    styles.add(ParagraphStyle(name="Smallx",parent=styles["BodyText"],fontSize=8,leading=10))
-    def p(x,style="BodyText"):
-        return Paragraph(escape(str(x)).replace("\n","<br/>"),styles[style])
-    story=[p("Smart CV Analyzer Pro Report","Title"),p("Generated: "+datetime.now().strftime("%d %b %Y, %H:%M")),Spacer(1,10)]
-    story += [p(f"Candidate: {d['name']}"),p(f"Email: {d['email']} | Phone: {d['phone']}"),
-              p(f"CV Score: {d['score']}/100 — {grade(d['score'])}"),p(f"Word count: {d['word_count']}"),Spacer(1,8)]
-    rows=[[p("Section","Smallx"),p("Score","Smallx"),p("Maximum","Smallx")]]
-    rows += [[p(k,"Smallx"),p(v,"Smallx"),p(m,"Smallx")] for k,(v,m) in d["breakdown"].items()]
-    t=Table(rows,colWidths=[10*cm,3*cm,3*cm],repeatRows=1)
-    t.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),colors.HexColor("#4f46e5")),("TEXTCOLOR",(0,0),(-1,0),colors.white),("GRID",(0,0),(-1,-1),.4,colors.grey),("VALIGN",(0,0),(-1,-1),"TOP")]))
-    story += [t,Spacer(1,12)]
-    for title,key in [("Skills","all_skills"),("Education","education"),("Experience","experience"),("Projects","projects"),("Certifications","certifications")]:
-        story.append(p(title,"Heading2"))
-        values=d[key] or ["Not detected"]
-        story.append(p(", ".join(values) if key in ("Skills",) else "\n".join("• "+str(x) for x in values)))
-    story.append(p("Top job matches","Heading2"))
-    for j in d["jobs"][:6]: story.append(p(f"{j['Role']}: {j['Match %']}% — matched: {', '.join(j['Matched']) or 'none'}"))
-    story.append(p("Improvement tips","Heading2"))
-    for tip in d["tips"] or ["Keep your CV updated."]: story.append(p("• "+tip))
-    doc.build(story); return buf.getvalue()
-
-# ------------------------------ UI ------------------------------
-st.markdown("""<style>
-.stApp{background:#0b1020;color:#e5e7eb}.block-container{max-width:1450px;padding-top:1.2rem}
-.hero{padding:28px 32px;border-radius:20px;background:linear-gradient(120deg,#4338ca,#7c3aed,#db2777);margin-bottom:18px}
-.hero h1,.hero p{color:white!important;margin:0}.hero p{margin-top:8px}
-div[data-testid="stMetric"]{background:#111827;border:1px solid #2b3245;padding:14px;border-radius:14px}
-.card{background:#111827;border:1px solid #2b3245;border-radius:14px;padding:16px;margin:8px 0}
-.muted{color:#9ca3af}.stButton button,.stDownloadButton button{border-radius:10px;font-weight:700}
-</style>""",unsafe_allow_html=True)
-for k,v in {"logged_in":False,"user_id":None,"user_name":"","user_email":"","page":"Analyzer"}.items(): st.session_state.setdefault(k,v)
-
-def hero(title,sub):
-    st.markdown(f'<div class="hero"><h1>{escape(title)}</h1><p>{escape(sub)}</p></div>',unsafe_allow_html=True)
-def chips(items):
-    return " · ".join(str(x) for x in items) if items else "None detected"
 def logout():
+    token = st.session_state.get("token")
+    if token:
+        q("DELETE FROM sessions WHERE token_hash=?", (token_hash(token),), commit=True)
     for k in list(st.session_state.keys()):
-        if k not in ("page",): del st.session_state[k]
-    st.session_state.update(logged_in=False,user_id=None,user_name="",user_email="")
+        del st.session_state[k]
+    try:
+        st.query_params.clear()
+    except Exception:
+        pass
+
+
+# ============================== HISTORY STORAGE ==============================
+def save_analysis(uid, a, text, pdf):
+    hid = q("INSERT INTO resume_history(user_id,file_name,industry,cv_score,job_match,ocr_used,analysis_json,extracted_text,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            (uid, a["file_name"], a["industry"], a["score"], a["job_match"], 1 if a["ocr_used"] else 0, json.dumps(a), text, now_str()),
+            commit=True, lastrowid=True)
+    if pdf:
+        q("INSERT INTO reports(history_id,user_id,file_name,pdf,created_at) VALUES(?,?,?,?,?)",
+          (hid, uid, f"CV_Analyser_Report_{hid}.pdf", sqlite3.Binary(pdf), now_str()), commit=True)
+    return hid
+
+
+def load_report(uid, hid):
+    row = q("SELECT pdf FROM reports WHERE history_id=? AND user_id=? ORDER BY id DESC LIMIT 1", (hid, uid), one=True)
+    return bytes(row[0]) if row and row[0] else None
+
+# =============================== STYLE (light theme only) ===============================
+st.markdown(
+    """
+<style>
+:root, .stApp { color-scheme: light !important; }
+html, body, .stApp, [data-testid="stAppViewContainer"], [data-testid="stMain"] { background: #f8f9fb !important; }
+#MainMenu, footer, [data-testid="stToolbar"], [data-testid="stDecoration"], [data-testid="stStatusWidget"] { display: none !important; }
+header[data-testid="stHeader"] { background: transparent !important; }
+.block-container { padding-top: 3rem; padding-bottom: 2rem; max-width: 760px; }
+
+/* every piece of text stays dark and readable, even if the browser is in dark mode */
+.stApp, .stApp p, .stApp li, .stApp label, .stApp h1, .stApp h2, .stApp h3, .stApp h4,
+[data-testid="stWidgetLabel"] p, [data-testid="stMarkdownContainer"], [data-testid="stCaptionContainer"] { color: #1f2937; }
+[data-testid="stAlert"] * { color: #1f2937 !important; }
+a { color: #4f46e5; }
+
+.hero { background: linear-gradient(135deg, #6e56ff, #ff5a8a); border-radius: 18px; padding: 28px 22px;
+        text-align: center; box-shadow: 0 10px 28px rgba(110,86,255,.28); margin-bottom: 18px; }
+.hero h1 { color: #ffffff !important; font-size: 1.9rem; margin: 0; padding: 0; }
+.hero p { color: #ffffff !important; opacity: .95; margin: 8px 0 0; font-size: 1rem; }
+.greet { text-align: center; color: #4b5563; margin: -4px 0 12px; font-size: .95rem; }
+.mobile-hint { display: none; text-align: center; color: #6b7280; font-size: .8rem; margin-bottom: 10px; }
+@media (max-width: 640px) { .mobile-hint { display: block; } }
+
+/* cards */
+.st-key-upload_card, .st-key-auth_card, [data-testid="stVerticalBlockBorderWrapper"] {
+    background: #ffffff; border: 1px solid #e5e7eb; border-radius: 18px; padding: 18px 18px 8px;
+    box-shadow: 0 6px 20px rgba(17,24,39,.07); }
+[data-testid="stForm"] { border: none !important; padding: 0 !important; background: transparent !important; }
+
+/* inputs */
+textarea, input { background: #ffffff !important; color: #111827 !important; -webkit-text-fill-color: #111827 !important; }
+::placeholder { color: #9ca3af !important; -webkit-text-fill-color: #9ca3af !important; opacity: 1; }
+[data-baseweb="input"], [data-baseweb="base-input"], [data-baseweb="textarea"] { background: #ffffff !important; border-color: #d1d5db !important; }
+[data-baseweb="select"] > div { background: #ffffff !important; border-color: #d1d5db !important; }
+[data-baseweb="select"] *, [data-baseweb="popover"] *, [data-baseweb="menu"] * { color: #111827 !important; }
+[data-baseweb="popover"], [data-baseweb="popover"] ul, [data-baseweb="menu"] { background: #ffffff !important; }
+li[role="option"]:hover { background: #eef0ff !important; }
+[data-testid="stFileUploaderDropzone"] { background: #f3f4f6 !important; border: 1px dashed #9ca3af; }
+[data-testid="stFileUploaderDropzone"] * { color: #374151 !important; }
+[data-testid="stFileUploaderDropzone"] [data-testid^="stBaseButton"] { background: #ffffff !important; border: 1px solid #d1d5db !important; box-shadow: none; }
+[data-testid="stExpander"] { background: #ffffff !important; border: 1px solid #e5e7eb !important; border-radius: 14px; }
+[data-testid="stExpander"] summary, [data-testid="stExpander"] summary * { color: #1f2937 !important; }
+
+/* buttons */
+.stButton, .stFormSubmitButton, .stDownloadButton { width: 100%; }
+[data-testid^="stBaseButton"] { width: 100%; border-radius: 14px; font-weight: 800; padding: .6rem 1rem; border: none;
+    background: linear-gradient(135deg, #6e56ff, #8b6bff) !important; box-shadow: 0 8px 18px rgba(110,86,255,.3); }
+[data-testid^="stBaseButton"], [data-testid^="stBaseButton"] * { color: #ffffff !important; }
+[data-testid="stFileUploaderDropzone"] [data-testid^="stBaseButton"], [data-testid="stFileUploaderDropzone"] [data-testid^="stBaseButton"] * { color: #374151 !important; }
+
+/* sidebar (shown only after login) */
+[data-testid="stSidebar"] { background: #ffffff !important; border-right: 1px solid #e5e7eb; }
+[data-testid="stSidebar"] p, [data-testid="stSidebar"] label, [data-testid="stSidebar"] span, [data-testid="stSidebar"] div { color: #1f2937; }
+
+/* tabs, metrics */
+.stTabs [data-baseweb="tab"] p { color: #374151 !important; }
+[data-testid="stMetricValue"], [data-testid="stMetricLabel"], [data-testid="stMetricLabel"] * { color: #1f2937 !important; }
+
+/* custom blocks */
+.mbox { background: #ffffff; border: 1px solid #e5e7eb; border-radius: 16px; padding: 16px 8px; text-align: center;
+        box-shadow: 0 4px 14px rgba(17,24,39,.06); margin-bottom: 10px; }
+.mbox .v { font-size: 1.8rem; font-weight: 800; color: #6e56ff; }
+.mbox .l { font-size: .85rem; color: #6b7280; font-weight: 600; }
+.panel { background: #ffffff; border: 1px solid #e5e7eb; border-radius: 16px; padding: 14px 16px; margin-bottom: 12px; }
+.panel h4 { margin: 0 0 8px; }
+code { background: #eef0ff !important; color: #4f46e5 !important; padding: 3px 8px; border-radius: 8px; margin: 2px; display: inline-block; font-size: .85rem; }
+.chip { display: inline-block; padding: 4px 11px; margin: 3px; border-radius: 999px; background: #eef0ff; border: 1px solid #c9c2ff; color: #3b2fb0 !important; font-size: .82rem; }
+.chip.ok { background: #e8f8ee; border-color: #a7e3bd; color: #166534 !important; }
+.chip.miss { background: #fdecec; border-color: #f5b5b5; color: #991b1b !important; }
+.tbl-wrap { overflow-x: auto; background: #ffffff; border: 1px solid #e5e7eb; border-radius: 14px; margin-bottom: 14px; }
+.tbl { width: 100%; border-collapse: collapse; font-size: .88rem; }
+.tbl th { background: #eef0ff; color: #3b2fb0; text-align: left; padding: 9px 12px; white-space: nowrap; }
+.tbl td { padding: 9px 12px; border-top: 1px solid #eef0f4; color: #1f2937; white-space: nowrap; }
+.foot { text-align: center; color: #6b7280; font-size: .85rem; margin-top: 28px; }
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+
+# ============================== UI HELPERS ==============================
+def footer():
+    st.markdown('<div class="foot">Made with ❤️ for Students | Visible in Light &amp; Dark Theme</div>', unsafe_allow_html=True)
+
+
+def make_card(key):
+    try:
+        return st.container(key=key)
+    except TypeError:  # older Streamlit versions
+        return st.container(border=True)
+
+
+def mbox(col, label, value):
+    col.markdown(f'<div class="mbox"><div class="v">{escape(str(value))}</div><div class="l">{escape(label)}</div></div>', unsafe_allow_html=True)
+
+
+def chips(items, cls=""):
+    return "".join(f'<span class="chip {cls}">{escape(str(i))}</span>' for i in items) or "—"
+
+
+def bullets_html(items, empty="Not found"):
+    return "".join(f"<div>• {escape(str(x))}</div>" for x in items) or f"<div>{empty}</div>"
+
+
+def show_fig(fig):
+    try:
+        st.pyplot(fig)
+    except Exception:
+        st.info("Chart could not be displayed.")
+    finally:
+        try:
+            _plt().close(fig)
+        except Exception:
+            pass
+
+
+def render_analysis(a, key, pdf=None):
+    """The full dashboard for one analysed resume (used on the Analyze, Dashboard and History pages)."""
+    glabel, _ = grade(a["score"])
+    if pdf is None:
+        try:
+            pdf = build_report_pdf(a)
+        except Exception:
+            pdf = None
+    d1, d2 = st.columns(2)
+    if pdf:
+        d1.download_button("⬇️ PDF Report", pdf, file_name="CV_Analyser_Report.pdf", mime="application/pdf", key=f"pdf_{key}")
+    d2.download_button("⬇️ TXT Report", report_txt(a), file_name="CV_Analyser_Report.txt", mime="text/plain", key=f"txt_{key}")
+
+    t1, t2, t3, t4 = st.tabs(["📊 Dashboard", "🧩 Details", "💼 Roles & Job Match", "💡 Suggestions"])
+
+    with t1:
+        cols = st.columns(4)
+        for col, (lab, val) in zip(cols, [("CV Score", f"{a['score']}/100"), ("Job Match", f"{a['job_match']}%"),
+                                          ("Skills Found", len(a["skills"])), ("Experience", f"{a['experience_years']} yrs")]):
+            mbox(col, lab, val)
+        st.progress(max(0.0, min(1.0, a["score"] / 100)))
+        extra = " · 🔍 OCR used" if a.get("ocr_used") else ""
+        st.markdown(f'<div class="panel"><b>Industry:</b> {escape(a["industry"])} · <b>Rating:</b> {glabel} · '
+                    f'<b>Education:</b> {escape(a["highest_education"])}{extra}</div>', unsafe_allow_html=True)
+        g1, g2 = st.columns(2)
+        with g1:
+            show_fig(chart_score(a["score"]))
+        with g2:
+            show_fig(chart_breakdown(a["breakdown"]))
+        show_fig(chart_industry(a["industry_fit"]))
+
+    with t2:
+        c = a["contact"]
+        info = (f"<div><b>Name:</b> {escape(c['name'])}</div><div><b>Email:</b> {escape(c['email'])}</div>"
+                f"<div><b>Phone:</b> {escape(c['phone'])}</div><div><b>LinkedIn:</b> {escape(c['linkedin'] or '-')}</div>"
+                f"<div><b>GitHub:</b> {escape(c['github'] or '-')}</div>")
+        st.markdown(f'<div class="panel"><h4>👤 Candidate</h4>{info}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="panel"><h4>🧠 Skills ({escape(a["industry"])})</h4>{chips(a["skills"])}'
+                    f'<div style="margin-top:8px"><b>Soft skills:</b> {chips(a["soft_skills"])}</div></div>', unsafe_allow_html=True)
+        for title, items in [(f"🎓 Education ({escape(a['highest_education'])})", a["education"]),
+                             (f"💼 Experience ({a['experience_years']} yrs)", a["experience"]),
+                             ("📜 Certifications", a["certifications"]), ("🚀 Projects", a["projects"])]:
+            st.markdown(f'<div class="panel"><h4>{title}</h4>{bullets_html(items)}</div>', unsafe_allow_html=True)
+
+    with t3:
+        show_fig(chart_roles(a["roles"]))
+        if not a["roles"]:
+            st.info("No industry-specific skills were detected, so roles could not be matched. Add a clear Skills section.")
+        for i, r in enumerate(a["roles"][:6]):
+            with st.expander(f"{r['role']} — {r['match']}% match ({r['industry']})", expanded=(i == 0)):
+                st.progress(max(0.0, min(1.0, r["match"] / 100)))
+                st.markdown(f"**Matched skills:** {chips(r['matched'], 'ok')}", unsafe_allow_html=True)
+                st.markdown(f"**Skills to learn:** {chips(r['missing'], 'miss')}", unsafe_allow_html=True)
+        j = a.get("jd")
+        if j:
+            st.markdown("### 🎯 Job Description Match")
+            st.progress(max(0.0, min(1.0, j["percent"] / 100)))
+            (st.success if j["percent"] > 75 else st.warning)(f"Your resume matches {j['percent']}% of the job description (keyword overlap {j['keyword_overlap']}%).")
+            st.markdown(f"**Matched:** {chips(j['matched'], 'ok')}", unsafe_allow_html=True)
+            st.markdown(f"**Missing:** {chips(j['missing'], 'miss')}", unsafe_allow_html=True)
+            if j["missing_keywords"]:
+                st.markdown(f"**Other missing keywords:** {chips(j['missing_keywords'], 'miss')}", unsafe_allow_html=True)
+
+    with t4:
+        st.markdown(f'<div class="panel"><h4>💡 Improvement Suggestions</h4>{bullets_html(a["tips"], "Great CV! Keep it updated.")}</div>', unsafe_allow_html=True)
+        st.markdown("**Score breakdown**")
+        for cat, (val, mx) in a["breakdown"].items():
+            st.write(f"{cat} — {val}/{mx}")
+            st.progress(max(0.0, min(1.0, float(val) / mx)))
+
+
+# ============================== AUTH PAGES ==============================
+def auth_state():
+    return st.session_state.get("auth")
+
+
+def start_login(identifier, password):
+    """Step 1 of login: check the password, then send an OTP. Returns an error message or None."""
+    kind, val = identify(identifier)
+    if not kind or not password:
+        return "Please enter your email / mobile number and your password."
+    u = find_user(kind, val)
+    if not u:
+        verify_password(password, DUMMY_HASH)          # same timing for unknown accounts
+        return "Invalid credentials."
+    if u[6] and u[6] > now_str():
+        mins = max(1, int((datetime.strptime(u[6], "%Y-%m-%d %H:%M:%S") - datetime.now()).total_seconds() // 60) + 1)
+        return f"Account temporarily locked after too many wrong passwords. Try again in about {mins} min."
+    if not verify_password(password, u[4]):
+        fails = (u[5] or 0) + 1
+        if fails >= MAX_LOGIN_FAILS:
+            q("UPDATE users SET failed_attempts=0, locked_until=? WHERE id=?", (ts_after(minutes=LOCK_MIN), u[0]), commit=True)
+            return f"Too many wrong attempts. The account is locked for {LOCK_MIN} minutes."
+        q("UPDATE users SET failed_attempts=? WHERE id=?", (fails, u[0]), commit=True)
+        return f"Invalid credentials. {MAX_LOGIN_FAILS - fails} attempt(s) left."
+    q("UPDATE users SET failed_attempts=0, locked_until=NULL WHERE id=?", (u[0],), commit=True)
+    return begin_otp(u, "login", "login")
+
+
+def begin_otp(u, purpose, flow):
+    res = issue_otp(u, purpose)
+    if not res["ok"]:
+        return res["msg"]
+    st.session_state["auth"] = {"flow": flow, "uid": u[0], "stage": "otp", "demo": res.get("demo"), "mode": res["mode"], "dest": mask_contact(u)}
     st.rerun()
 
-def auth_screen():
-    hero("📄 Smart CV Analyzer Pro","Analyze your CV, discover job matches, and keep track of your progress.")
-    _,mid,_=st.columns([1,1.5,1])
-    with mid:
-        login,signup,reset=st.tabs(["🔐 Login","📝 Create account","🔑 Reset password"])
-        with login:
-            e=st.text_input("Email",key="login_email").strip().lower()
-            p=st.text_input("Password",type="password",key="login_pass")
-            if st.button("Login",type="primary",use_container_width=True):
-                u=query("SELECT * FROM users WHERE email=?",(e,),one=True)
-                if u and verify_password(p,u["password_hash"]):
-                    st.session_state.update(logged_in=True,user_id=u["id"],user_name=u["name"],user_email=u["email"])
-                    st.rerun()
-                else: st.error("Email or password is incorrect.")
-        with signup:
-            n=st.text_input("Full name",key="signup_name")
-            e2=st.text_input("Email",key="signup_email").strip().lower()
-            p1=st.text_input("Password (minimum 8 characters)",type="password",key="signup_pass")
-            p2=st.text_input("Confirm password",type="password",key="signup_confirm")
-            if st.button("Create account",type="primary",use_container_width=True):
-                if not n.strip() or not e2 or not p1: st.error("Please fill in every field.")
-                elif not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+",e2): st.error("Enter a valid email.")
-                elif len(p1)<8: st.error("Use at least 8 characters.")
-                elif p1!=p2: st.error("Passwords do not match.")
-                else:
-                    try:
-                        query("INSERT INTO users(name,email,password_hash,created_at) VALUES(?,?,?,?)",(n.strip(),e2,password_hash(p1),datetime.now().strftime("%Y-%m-%d")),commit=True)
-                        st.success("Account created. Please log in.")
-                    except sqlite3.IntegrityError: st.error("That email is already registered.")
-        with reset:
-            st.warning("For this local/demo app, password reset verifies your email and full name. For a public deployment, configure verified email OTP/reset links.")
-            er=st.text_input("Registered email",key="reset_email").strip().lower()
-            nr=st.text_input("Full name on account",key="reset_name")
-            np=st.text_input("New password (minimum 8 characters)",type="password",key="reset_pass")
-            if st.button("Reset password",use_container_width=True):
-                u=query("SELECT id,name FROM users WHERE email=?",(er,),one=True)
-                if not u or u["name"].casefold()!=nr.strip().casefold(): st.error("Email and account name do not match.")
-                elif len(np)<8: st.error("Use at least 8 characters.")
-                else:
-                    query("UPDATE users SET password_hash=? WHERE id=?",(password_hash(np),u["id"]),commit=True)
-                    st.success("Password updated. You can log in.")
-    st.caption("Privacy: CVs and analysis history are stored in the local SQLite database on this computer/server.")
 
-if not st.session_state.logged_in:
-    auth_screen()
+def otp_screen(auth):
+    u = q(f"SELECT {USER_COLS} FROM users WHERE id=?", (auth["uid"],), one=True)
+    if not u:
+        st.session_state.pop("auth", None)
+        st.rerun()
+    purpose = "login" if auth["flow"] == "login" else "reset"
+    st.markdown("### 🔐 Verify OTP")
+    if auth["mode"] == "demo":
+        st.warning(f"Demo mode: SMS/email is not configured, so the OTP is shown here: **{auth['demo']}**")
+    else:
+        st.info(f"A 6-digit OTP was sent to {auth['dest']}. It is valid for {OTP_TTL_MIN} minutes.")
+    with st.form("otp_form"):
+        code = st.text_input("Enter OTP", max_chars=6, key="otp_code", placeholder="6-digit code")
+        ok = st.form_submit_button("Verify OTP", type="primary")
+    if ok:
+        good, msg = verify_otp(auth["uid"], purpose, code)
+        if not good:
+            st.error(msg)
+        elif auth["flow"] == "login":
+            st.session_state.update(logged_in=True, user_id=u[0], user_name=u[1], user_email=u[2] or u[3] or "")
+            st.session_state.pop("auth", None)
+            create_session(u[0])
+            st.rerun()
+        else:
+            auth["stage"] = "newpass"
+            auth["demo"] = None
+            st.session_state["auth"] = auth
+            st.rerun()
+    c1, c2 = st.columns(2)
+    if c1.button("🔁 Resend OTP", key="b_resend"):
+        res = issue_otp(u, purpose)
+        if res["ok"]:
+            auth.update(demo=res.get("demo"), mode=res["mode"])
+            st.session_state["auth"] = auth
+            st.rerun()
+        else:
+            st.error(res["msg"])
+    if c2.button("⬅ Back", key="b_back"):
+        st.session_state.pop("auth", None)
+        st.rerun()
+
+
+def new_password_screen(auth):
+    st.markdown("### 🔑 Set a new password")
+    with st.form("newpass_form"):
+        p1 = st.text_input("New password (min 8 characters, letters + numbers)", type="password", key="np1")
+        p2 = st.text_input("Confirm new password", type="password", key="np2")
+        ok = st.form_submit_button("Update Password", type="primary")
+    if ok:
+        problem = password_problem(p1)
+        if problem:
+            st.error(problem)
+        elif p1 != p2:
+            st.error("Passwords do not match.")
+        else:
+            q("UPDATE users SET password_hash=?, failed_attempts=0, locked_until=NULL WHERE id=?", (hash_password(p1), auth["uid"]), commit=True)
+            q("DELETE FROM sessions WHERE user_id=?", (auth["uid"],), commit=True)
+            st.session_state.pop("auth", None)
+            st.session_state["flash"] = "✅ Password updated. Please log in with your new password."
+            st.rerun()
+
+
+def login_page():
+    flash = st.session_state.pop("flash", None)
+    with make_card("auth_card"):
+        auth = auth_state()
+        if auth and auth["stage"] == "otp":
+            otp_screen(auth)
+            return
+        if auth and auth["stage"] == "newpass":
+            new_password_screen(auth)
+            return
+        if flash:
+            st.success(flash)
+        t1, t2, t3 = st.tabs(["🔐 Login", "📝 Sign Up", "🔑 Forgot Password"])
+        with t1:
+            with st.form("login_form"):
+                ident = st.text_input("Email or mobile number", key="li", placeholder="you@example.com or 9876543210")
+                pw = st.text_input("Password", type="password", key="lp")
+                go = st.form_submit_button("Login & send OTP", type="primary")
+            if go:
+                err = start_login(ident, pw)
+                if err:
+                    st.error(err)
+        with t2:
+            with st.form("signup_form"):
+                name = st.text_input("Full Name", key="sn")
+                email = st.text_input("Email (optional if you give a mobile number)", key="se")
+                mobile = st.text_input("Mobile number (optional if you give an email)", key="sm")
+                p1 = st.text_input("Password (min 8 characters, letters + numbers)", type="password", key="sp1")
+                p2 = st.text_input("Confirm Password", type="password", key="sp2")
+                go2 = st.form_submit_button("Create Account", type="primary")
+            if go2:
+                email, mob = email.strip().lower(), (normalize_mobile(mobile) if mobile.strip() else None)
+                if not name.strip():
+                    st.error("Please enter your name.")
+                elif not email and not mob:
+                    st.error("Please enter an email or a valid mobile number.")
+                elif email and not EMAIL_FULL.match(email):
+                    st.error("Invalid email address.")
+                elif mobile.strip() and not mob:
+                    st.error("Invalid mobile number (10 digits expected).")
+                elif password_problem(p1):
+                    st.error(password_problem(p1))
+                elif p1 != p2:
+                    st.error("Passwords do not match.")
+                elif (email and q("SELECT id FROM users WHERE email=?", (email,), one=True)) or (mob and q("SELECT id FROM users WHERE mobile=?", (mob,), one=True)):
+                    st.error("An account with this email or mobile already exists. Please log in.")
+                else:
+                    q("INSERT INTO users(name,email,mobile,password_hash,created_at) VALUES(?,?,?,?,?)",
+                      (name.strip(), email or None, mob, hash_password(p1), datetime.now().strftime("%Y-%m-%d")), commit=True)
+                    st.success("✅ Account created! Now use the Login tab - you will receive an OTP to verify.")
+        with t3:
+            with st.form("reset_form"):
+                ident2 = st.text_input("Registered email or mobile number", key="fi")
+                go3 = st.form_submit_button("Send OTP", type="primary")
+            if go3:
+                kind, val = identify(ident2)
+                u = find_user(kind, val) if kind else None
+                if not u:
+                    st.error("No account found with these details.")
+                else:
+                    err = begin_otp(u, "reset", "reset")
+                    if err:
+                        st.error(err)
+
+
+# ============================== PAGE: ANALYZE ==============================
+def page_analyze(uid):
+    with make_card("upload_card"):
+        st.markdown("### 📤 Upload Resume")
+        mode = st.radio("Input method", ["Upload File", "Paste Text"], horizontal=True, label_visibility="collapsed")
+        uploaded, pasted = None, ""
+        if mode == "Upload File":
+            uploaded = st.file_uploader("Upload resume", type=["pdf", "docx", "txt", "jpg", "jpeg", "png"], label_visibility="collapsed")
+            st.caption("PDF, DOCX, TXT, JPG, PNG — scanned PDFs and photos are read with OCR.")
+            if uploaded is not None:
+                st.success(f"✅ Uploaded: {uploaded.name}")
+        else:
+            pasted = st.text_area("Paste resume text", height=250, label_visibility="collapsed", placeholder="Paste your resume text here...")
+        st.markdown("### 💼 Job Description (Optional)")
+        jd_text = st.text_area("Job description", height=120, label_visibility="collapsed", placeholder="Paste a job description to get a job-match score...")
+        go = st.button("🔍 Analyze Resume Now", type="primary")
+
+    if go:
+        st.session_state.pop("result", None)
+        text, fname, ocr, failed = "", "Pasted Text", False, False
+        try:
+            if mode == "Upload File":
+                if uploaded is None:
+                    st.warning("Please upload a resume file first, or switch to Paste Text.")
+                    failed = True
+                else:
+                    fname = uploaded.name
+                    with st.spinner("Reading your file (OCR may take a few seconds)..."):
+                        text, ocr = extract_text(uploaded.name, uploaded.getvalue())
+            else:
+                text = pasted
+                if not text.strip():
+                    st.warning("Please paste your resume text first.")
+                    failed = True
+        except Exception as exc:
+            st.error(f"❌ Could not read the file: {exc} You can also use **Paste Text**.")
+            failed = True
+        if failed:
+            pass
+        elif len(text.strip()) < 30:
+            st.error("❌ Not enough readable text found in this file. Try a clearer scan / photo, or use **Paste Text**.")
+        else:
+            with st.spinner("Analysing..."):
+                a = analyze_text(text, fname, jd_text, ocr)
+                try:
+                    pdf = build_report_pdf(a)
+                except Exception:
+                    pdf = None
+                save_analysis(uid, a, text, pdf)
+            st.session_state["result"] = {"a": a, "pdf": pdf, "text": text}
+            st.session_state["saved_msg"] = True
+
+    res = st.session_state.get("result")
+    if res:
+        if st.session_state.pop("saved_msg", False):
+            st.success("✅ Analysis complete and saved to History")
+        with st.expander("📄 View Extracted Text"):
+            st.text(res["text"][:6000])
+        render_analysis(res["a"], "cur", res["pdf"])
+
+
+# ============================== PAGE: DASHBOARD ==============================
+def page_dashboard(uid):
+    st.markdown("## 📊 Dashboard")
+    rows = q("SELECT id,created_at,cv_score,job_match,industry FROM resume_history WHERE user_id=? ORDER BY id", (uid,))
+    if not rows:
+        st.info("No resumes analysed yet. Open **Analyze Resume** and upload your CV!")
+        return
+    scores = [r[2] for r in rows]
+    c1, c2, c3, c4 = st.columns(4)
+    mbox(c1, "Total Scans", len(rows)); mbox(c2, "Average Score", f"{sum(scores) / len(scores):.0f}")
+    mbox(c3, "Best Score", f"{max(scores):.0f}"); mbox(c4, "Latest Job Match", f"{rows[-1][3]:.0f}%")
+    if len(rows) >= 2:
+        show_fig(chart_trend([r[1] for r in rows], scores))
+    st.markdown("### 🕒 Latest analysis")
+    row = q("SELECT analysis_json FROM resume_history WHERE id=? AND user_id=?", (rows[-1][0], uid), one=True)
+    try:
+        a = json.loads(row[0])
+    except Exception:
+        st.info("The latest record could not be displayed.")
+        return
+    render_analysis(a, "dash", load_report(uid, rows[-1][0]))
+
+
+# ============================== PAGE: HISTORY ==============================
+def page_history(uid):
+    st.markdown("## 📚 History / My Resumes")
+    rows = q("SELECT id,created_at,file_name,industry,cv_score,job_match,ocr_used FROM resume_history WHERE user_id=?", (uid,))
+    m1, m2, m3 = st.columns(3)
+    mbox(m1, "Total Scans", len(rows))
+    mbox(m2, "Average Score", f"{sum(r[4] for r in rows) / len(rows):.0f}" if rows else "0")
+    best = {}
+    for r in rows:
+        best.setdefault(r[3], []).append(r[4])
+    mbox(m3, "Best Industry", max(best, key=lambda k: sum(best[k]) / len(best[k]))[:18] if best else "N/A")
+    if not rows:
+        st.info("No resumes analysed yet. Open **Analyze Resume** to start!")
+        return
+    search = st.text_input("🔎 Search by file name or industry").strip().lower()
+    f1, f2 = st.columns(2)
+    industry = f1.selectbox("Industry", ["All"] + sorted({r[3] for r in rows if r[3]}))
+    sort = f2.selectbox("Sort by", ["Date (Newest)", "Date (Oldest)", "Score (High)", "Score (Low)"])
+    if search:
+        rows = [r for r in rows if search in (r[2] or "").lower() or search in (r[3] or "").lower()]
+    if industry != "All":
+        rows = [r for r in rows if r[3] == industry]
+    keyf = {"Date (Newest)": lambda r: (r[1], r[0]), "Date (Oldest)": lambda r: (r[1], r[0]), "Score (High)": lambda r: r[4], "Score (Low)": lambda r: r[4]}[sort]
+    rows = sorted(rows, key=keyf, reverse=sort in ("Date (Newest)", "Score (High)"))
+    rows = rows[:60]
+    body = "".join(f"<tr><td>{escape(str(r[1]))[:16]}</td><td>{escape(str(r[2]))}</td><td>{escape(str(r[3]))}</td><td>{r[4]:.0f}</td><td>{r[5]:.0f}%</td></tr>" for r in rows)
+    st.markdown(f'<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Date</th><th>File</th><th>Industry</th><th>CV Score</th><th>Job Match</th></tr></thead><tbody>{body}</tbody></table></div>', unsafe_allow_html=True)
+
+    st.markdown("### 📂 Records")
+    for r in rows:
+        rid = r[0]
+        ci, cv, cd, cp = st.columns([3, 1, 1, 1])
+        ci.markdown(f"**{escape(str(r[2]))}**  \n{escape(str(r[3]))} · {r[4]:.0f}/100 · {escape(str(r[1]))[:16]}")
+        if cv.button("👁️ View", key=f"v{rid}"):
+            st.session_state["view_id"] = None if st.session_state.get("view_id") == rid else rid
+            st.rerun()
+        if cd.button("🗑️ Delete", key=f"x{rid}"):
+            q("DELETE FROM reports WHERE history_id=? AND user_id=?", (rid, uid), commit=True)
+            q("DELETE FROM resume_history WHERE id=? AND user_id=?", (rid, uid), commit=True)
+            if st.session_state.get("view_id") == rid:
+                st.session_state["view_id"] = None
+            st.rerun()
+        pdf = load_report(uid, rid)
+        if pdf:
+            cp.download_button("⬇️ PDF", pdf, file_name=f"CV_Analyser_Report_{rid}.pdf", mime="application/pdf", key=f"dp{rid}")
+        if st.session_state.get("view_id") == rid:
+            row = q("SELECT analysis_json,extracted_text FROM resume_history WHERE id=? AND user_id=?", (rid, uid), one=True)
+            try:
+                render_analysis(json.loads(row[0]), f"h{rid}", pdf)
+                with st.expander("📄 Extracted Text"):
+                    st.text((row[1] or "")[:6000])
+            except Exception:
+                st.info("This record could not be displayed.")
+        st.markdown("---")
+    confirm = st.checkbox("I confirm I want to delete ALL my history", key="confirm_clear")
+    if st.button("🧹 Clear All History", key="b_clear"):
+        if confirm:
+            q("DELETE FROM reports WHERE user_id=?", (uid,), commit=True)
+            q("DELETE FROM resume_history WHERE user_id=?", (uid,), commit=True)
+            st.session_state["view_id"] = None
+            st.rerun()
+        else:
+            st.warning("Tick the confirmation box first.")
+
+
+# ============================== PAGE: PROFILE ==============================
+def page_profile(uid):
+    st.markdown("## 👤 Profile")
+    u = q("SELECT name,email,mobile,created_at FROM users WHERE id=?", (uid,), one=True)
+    total = q("SELECT COUNT(*) FROM resume_history WHERE user_id=?", (uid,), one=True)[0]
+    c1, c2 = st.columns(2)
+    mbox(c1, "Name", u[0]); mbox(c2, "Email", u[1] or "-")
+    c3, c4 = st.columns(2)
+    mbox(c3, "Mobile", u[2] or "-"); mbox(c4, "Resumes Analysed", total)
+    st.caption(f"Member since {u[3] or 'N/A'}")
+    st.markdown("### 🔒 Change Password")
+    with st.form("pw_form"):
+        old = st.text_input("Current Password", type="password", key="op")
+        n1 = st.text_input("New Password (min 8 characters, letters + numbers)", type="password", key="n1")
+        n2 = st.text_input("Confirm New Password", type="password", key="n2")
+        go = st.form_submit_button("Update Password", type="primary")
+    if go:
+        row = q("SELECT password_hash FROM users WHERE id=?", (uid,), one=True)
+        if not verify_password(old, row[0]):
+            st.error("Current password is incorrect.")
+        elif password_problem(n1):
+            st.error(password_problem(n1))
+        elif n1 != n2:
+            st.error("Passwords do not match.")
+        else:
+            q("UPDATE users SET password_hash=? WHERE id=?", (hash_password(n1), uid), commit=True)
+            q("DELETE FROM sessions WHERE user_id=? AND token_hash!=?", (uid, token_hash(st.session_state.get("token") or "")), commit=True)
+            st.success("✅ Password updated.")
+    st.markdown("### ⚠️ Danger Zone")
+    ok = st.checkbox("I understand my account and all history will be permanently deleted", key="confirm_del")
+    if st.button("Delete Account", key="b_del"):
+        if ok:
+            for tbl in ("reports", "resume_history", "otps", "sessions"):
+                q(f"DELETE FROM {tbl} WHERE user_id=?", (uid,), commit=True)
+            q("DELETE FROM users WHERE id=?", (uid,), commit=True)
+            logout()
+            st.rerun()
+        else:
+            st.warning("Tick the confirmation box first.")
+
+
+# ============================== APP ==============================
+HERO = """<div class="hero"><h1>📄 CV Analyser</h1>
+<p>Upload your resume and get instant CV Score, Skills Analysis &amp; Job Match Report</p></div>"""
+
+restore_session()
+
+if not st.session_state.get("logged_in"):
+    st.markdown('<style>[data-testid="stSidebar"], [data-testid="stSidebarCollapsedControl"], [data-testid="collapsedControl"] { display: none !important; }</style>', unsafe_allow_html=True)
+    st.markdown(HERO, unsafe_allow_html=True)
+    login_page()
+    footer()
     st.stop()
 
-uid=st.session_state.user_id
+_uid = st.session_state["user_id"]
 with st.sidebar:
-    st.markdown("## 📄 Smart CV Analyzer")
-    st.success(f"Welcome, {st.session_state.user_name}")
-    page=st.radio("Navigation",["🔍 Analyzer","📚 History","👤 Profile"]+(["🛡️ Admin Panel"] if st.session_state.user_email.lower()==ADMIN_EMAIL else []),key="nav")
-    st.divider()
-    st.caption(f"Signed in as {st.session_state.user_email}")
-    if st.button("🚪 Logout",use_container_width=True): logout()
+    st.markdown(f'<div class="panel">👋 Welcome,<br><b>{escape(st.session_state.get("user_name", ""))}</b><br>'
+                f'<span style="color:#6b7280;font-size:.8rem">{escape(st.session_state.get("user_email", ""))}</span></div>', unsafe_allow_html=True)
+    page = st.radio("Menu", ["🔍 Analyze Resume", "📊 Dashboard", "📚 History", "👤 Profile"], key="nav")
+    if st.button("🚪 Logout", key="b_logout"):
+        logout()
+        st.rerun()
+
+st.markdown(HERO, unsafe_allow_html=True)
+st.markdown(f'<div class="greet">👋 Welcome, <b>{escape(st.session_state.get("user_name", ""))}</b></div>', unsafe_allow_html=True)
+st.markdown('<div class="mobile-hint">☰ Tap the arrow at the top-left to open the menu</div>', unsafe_allow_html=True)
 
 if page.startswith("🔍"):
-    hero("Smart CV Analyzer Pro","Upload a CV or paste its text to get an ATS-style score, skills, job matches and actionable feedback.")
-    left,right=st.columns([1,2.1])
-    with left:
-        mode=st.radio("Input method",["Upload file","Paste text"])
-        if mode=="Upload file":
-            uploaded=st.file_uploader("Upload CV / document / image / text file",type=SUPPORTED_EXTS,help="Supports PDF, DOCX, DOC (if antiword is installed), TXT, RTF, Markdown, CSV/TSV, HTML, JSON/XML, PPTX, XLSX/XLSM, ODT, common images and text/source files. Max 10 MB.")
-            raw=uploaded.getvalue() if uploaded else None
-            filename=uploaded.name if uploaded else "resume.txt"
-        else:
-            pasted=st.text_area("Paste CV text",height=280,placeholder="Paste the complete resume text here...")
-            raw=pasted.encode("utf-8") if pasted.strip() else None
-            filename="Pasted_CV.txt"
-        run=st.button("🚀 Analyze CV",type="primary",use_container_width=True,disabled=not raw)
-        st.caption("Max 10 MB. Scanned PDFs and images require Tesseract OCR to be installed on the server. Image-only PowerPoint slides may not yield text unless converted and OCR-processed.")
-    if run and raw:
-        try:
-            with st.spinner("Extracting and analyzing your CV..."):
-                text=extract_text(filename,raw)
-                if len(text.strip())<30:
-                    st.error("The file was opened, but too little readable text was found to analyze reliably.")
-                    st.info("Try a clearer/text-based PDF, DOCX or TXT. If this is a scanned PDF/image, install Tesseract OCR on the server. For spreadsheets, ensure the data cells are not empty.")
-                    st.download_button("Download extracted text for troubleshooting", text or "No text could be extracted.", file_name="extraction_diagnostic.txt", mime="text/plain")
-                else:
-                    result=analyze_text(text)
-                    result["filename"]=filename
-                    result["ideas"]=project_ideas(result["skills"])
-                    payload=json.dumps(result,ensure_ascii=False)
-                    top=result["jobs"][0] if result["jobs"] else {"Role":"General"}
-                    query("INSERT INTO resume_history(user_id,file_name,category,ats_score,found_skills,missing_skills,extracted_text,analysis_date,full_json) VALUES(?,?,?,?,?,?,?,?,?)",
-                      (uid,filename,top["Role"],result["score"],json.dumps(result["all_skills"],ensure_ascii=False),json.dumps(top["Missing"],ensure_ascii=False),text,datetime.now().strftime("%Y-%m-%d %H:%M"),payload),commit=True)
-                    st.session_state["current_result"]=result
-                    st.session_state.pop("jd_result",None)
-                    st.success("Analysis complete and saved to your history.")
-        except Exception as e:
-            st.error("File analysis could not be completed.")
-            st.warning(str(e))
-            with st.expander("Troubleshooting details"):
-                st.write(f"**File:** {filename}")
-                st.write(f"**Detected extension:** {Path(filename).suffix or 'none'}")
-                st.write(f"**File size:** {len(raw) / 1024:.1f} KB")
-                st.write("**Next step:** Follow the specific guidance above. If the same error repeats, try exporting the file to PDF, DOCX or TXT and upload again.")
-                st.download_button("Download error diagnostic", f"Smart CV Analyzer Pro diagnostic\nFile: {filename}\nExtension: {Path(filename).suffix}\nSize: {len(raw)} bytes\nError type: {type(e).__name__}\nMessage: {e}\n", file_name="cv_analyzer_error.txt", mime="text/plain")
-    d=st.session_state.get("current_result")
-    if d:
-        st.divider()
-        tabs=st.tabs(["📊 Dashboard","🧾 Extracted details","🤖 ATS checks","💼 Job matches","🎯 JD matcher","💡 Projects & report"])
-        with tabs[0]:
-            a,b,c,e=st.columns(4)
-            a.metric("CV Score",f"{d['score']}/100",grade(d["score"]))
-            b.metric("Skills detected",len(d["all_skills"]))
-            c.metric("Projects detected",len(d["projects"]))
-            e.metric("Word count",d["word_count"])
-            g=go.Figure(go.Indicator(mode="gauge+number",value=d["score"],title={"text":grade(d["score"])},gauge={"axis":{"range":[0,100]},"steps":[{"range":[0,45],"color":"#fee2e2"},{"range":[45,65],"color":"#fef3c7"},{"range":[65,80],"color":"#dbeafe"},{"range":[80,100],"color":"#dcfce7"}]}))
-            g.update_layout(height=280,margin=dict(t=50,b=10),paper_bgcolor="rgba(0,0,0,0)",font_color="#e5e7eb")
-            st.plotly_chart(g,use_container_width=True)
-            x,y=st.columns(2)
-            with x:
-                st.subheader("Score breakdown")
-                st.plotly_chart(px.bar(pd.DataFrame([{"Section":k,"Score":v,"Maximum":m} for k,(v,m) in d["breakdown"].items()]),x="Section",y=["Score","Maximum"],barmode="group"),use_container_width=True)
-            with y:
-                if d["skills"]:
-                    sdf=pd.DataFrame([{"Category":k,"Skills":len(v)} for k,v in d["skills"].items()])
-                    st.plotly_chart(px.pie(sdf,names="Category",values="Skills",hole=.45,title="Skill distribution"),use_container_width=True)
-            st.subheader("Top role matches")
-            showjobs=pd.DataFrame([{"Role":j["Role"],"Match %":j["Match %"]} for j in d["jobs"][:8]])
-            st.plotly_chart(px.bar(showjobs.sort_values("Match %"),x="Match %",y="Role",orientation="h",range_x=[0,100]),use_container_width=True)
-        with tabs[1]:
-            st.subheader("Extracted candidate details")
-            fields=["name","email","phone","linkedin","github"]
-            edited={}
-            cols=st.columns(2)
-            for i,k in enumerate(fields):
-                edited[k]=cols[i%2].text_input(k.replace("_"," ").title(),value=str(d.get(k,"") or ""),key="edit_"+k)
-            for title,key in [("Education","education"),("Experience","experience"),("Projects","projects"),("Certifications","certifications")]:
-                st.markdown("**"+title+"**")
-                value=st.text_area(title,value="\n".join(map(str,d.get(key,[]))),key="edit_"+key,height=100)
-                edited[key]=[line.strip() for line in value.splitlines() if line.strip()]
-            st.markdown("**Detected skills by category**")
-            for cat,items in d["skills"].items(): st.write(f"**{cat}:** {', '.join(items)}")
-            with st.expander("View extracted raw text"): st.text(d["text"])
-            if st.button("Apply edits to report",type="primary"):
-                d.update(edited); st.session_state["current_result"]=d; st.success("Edits applied to the downloadable report.")
-        with tabs[2]:
-            st.subheader("ATS-style checklist")
-            words=d["word_count"]; checks=[
-             ("Email and phone",d["email"]!="Not found" and d["phone"]!="Not found","Keep contact information easy to find."),
-             ("LinkedIn / GitHub",bool(d["linkedin"] or d["github"]),"Add a professional profile link if relevant."),
-             ("Skills",bool(d["skills"]),"Use a clearly labelled skills section."),
-             ("Education",bool(d["education"]),"Include qualification, institution and year."),
-             ("Projects",len(d["projects"])>=2,"Include 2–3 relevant projects."),
-             ("Measurable impact",bool(METRIC_RE.search(d["text"])),"Add truthful numbers/results where possible."),
-             ("Action verbs",any(re.search(r"\b"+v+r"\b",d["text"],re.I) for v in ACTION_VERBS),"Start bullet points with clear action verbs."),
-             ("CV length",250<=words<=900,f"Current word count: {words}; a useful target is often 250–900 words.")]
-            for title,ok,detail in checks:
-                st.markdown(f'<div class="card"><b>{"✅ PASS" if ok else "⚠️ IMPROVE"} — {escape(title)}</b><br><span class="muted">{escape(detail)}</span></div>',unsafe_allow_html=True)
-            st.subheader("Improvement plan")
-            for tip in d["tips"] or ["Good structure detected. Keep tailoring your CV to each role."]: st.write("• "+tip)
-            st.caption("This is a heuristic CV review, not a certified ATS score or a guarantee of hiring outcomes.")
-        with tabs[3]:
-            st.subheader("Role match estimates")
-            for j in d["jobs"][:12]:
-                with st.expander(f"{j['Role']} — {j['Match %']}% match",expanded=False):
-                    st.progress(j["Match %"]/100)
-                    st.write("**Matched skills:**",", ".join(pretty(s) for s in j["Matched"]) or "None detected")
-                    st.write("**Skills to learn if relevant:**",", ".join(pretty(s) for s in j["Missing"]) or "No listed gaps")
-                    st.write("**Example employers to research:**",", ".join(j["Companies"]))
-        with tabs[4]:
-            st.subheader("Job Description Matcher")
-            jd=st.text_area("Paste the job description",height=220,key="jd_area",placeholder="Paste requirements and responsibilities...")
-            if st.button("Match job description",type="primary"):
-                if not jd.strip(): st.warning("Paste a job description first.")
-                else: st.session_state["jd_result"]=jd_match(d["text"],jd)
-            jr=st.session_state.get("jd_result")
-            if jr:
-                if not jr["jd_skills"]: st.warning("No known technical/role keywords were found. Try pasting the full job description.")
-                else:
-                    a,b,c=st.columns(3); a.metric("Keyword match",f"{jr['match_percent']}%"); b.metric("Matched",len(jr["matched"])); c.metric("Missing",len(jr["missing"]))
-                    st.write("**Matched:**",", ".join(pretty(s) for s in jr["matched"]) or "None")
-                    st.write("**Missing / priority to consider:**",", ".join(pretty(s) for s in jr["priority"]) or "None")
-                    st.caption("Keyword overlap only; it does not assess seniority, quality or actual proficiency.")
-        with tabs[5]:
-            st.subheader("Project ideas based on detected skills")
-            for cat,idea in d["ideas"]: st.write(f"**{cat}:** {idea}")
-            st.divider()
-            try:
-                pdf=pdf_report(d)
-                safe=re.sub(r"[^A-Za-z0-9]+","_",d.get("name","Candidate")).strip("_") or "Candidate"
-                st.download_button("⬇️ Download PDF report",pdf,file_name=f"CV_Report_{safe}.pdf",mime="application/pdf",type="primary")
-            except Exception as e: st.error(f"PDF generation failed: {e}")
-            txt=f"SMART CV ANALYZER PRO REPORT\nGenerated: {datetime.now():%Y-%m-%d %H:%M}\nCandidate: {d['name']}\nCV score: {d['score']}/100 ({grade(d['score'])})\n\nSkills: {', '.join(d['all_skills'])}\n\nImprovement tips:\n"+"\n".join("- "+x for x in d["tips"])
-            st.download_button("⬇️ Download TXT report",txt,file_name="cv_report.txt",mime="text/plain")
-
+    page_analyze(_uid)
+elif page.startswith("📊"):
+    page_dashboard(_uid)
 elif page.startswith("📚"):
-    hero("📚 Analysis History","Review, search, download or delete your previous CV scans.")
-    rows=query("SELECT id,analysis_date,file_name,category,ats_score,found_skills,missing_skills,extracted_text,full_json FROM resume_history WHERE user_id=? ORDER BY id DESC",(uid,))
-    df=pd.DataFrame([dict(r) for r in rows])
-    if df.empty: st.info("No scans yet. Analyze a CV to start building your history.")
-    else:
-        a,b,c=st.columns(3); a.metric("Total scans",len(df)); b.metric("Average score",f"{df['ats_score'].mean():.1f}/100"); c.metric("Best score",f"{df['ats_score'].max():.0f}/100")
-        search=st.text_input("Search file or role")
-        if search: df=df[df["file_name"].str.contains(search,case=False,na=False,regex=False)|df["category"].str.contains(search,case=False,na=False,regex=False)]
-        sort=st.selectbox("Sort",["Newest first","Oldest first","Highest score","Lowest score"])
-        if sort=="Oldest first": df=df.sort_values("analysis_date")
-        elif sort=="Highest score": df=df.sort_values("ats_score",ascending=False)
-        elif sort=="Lowest score": df=df.sort_values("ats_score")
-        st.dataframe(df[["analysis_date","file_name","category","ats_score"]].rename(columns={"analysis_date":"Date","file_name":"File","category":"Best role","ats_score":"Score"}),use_container_width=True,hide_index=True)
-        for _,r in df.iterrows():
-            with st.expander(f"{r['file_name']} · {r['ats_score']}/100 · {r['analysis_date']}"):
-                st.write("**Best matching role:**",r["category"])
-                st.write("**Found skills:**",chips(json.loads(r["found_skills"] or "[]")))
-                st.write("**Missing skills:**",chips(json.loads(r["missing_skills"] or "[]")))
-                with st.expander("Extracted text"): st.text(r["extracted_text"] or "")
-                p=None
-                try: p=json.loads(r["full_json"]) if r["full_json"] else None
-                except Exception: pass
-                if p:
-                    try: st.download_button("Download PDF report",pdf_report(p),file_name=f"history_report_{int(r['id'])}.pdf",mime="application/pdf",key=f"histpdf{int(r['id'])}")
-                    except Exception as e: st.caption(f"PDF could not be rebuilt: {e}")
-                x,y=st.columns(2)
-                x.download_button("Download TXT summary",f"File: {r['file_name']}\nDate: {r['analysis_date']}\nScore: {r['ats_score']}/100\nRole: {r['category']}\nFound: {r['found_skills']}\nMissing: {r['missing_skills']}",file_name=f"history_{int(r['id'])}.txt",key=f"histtxt{int(r['id'])}")
-                if y.button("🗑️ Delete this scan",key=f"delhist{int(r['id'])}"):
-                    query("DELETE FROM resume_history WHERE id=? AND user_id=?",(int(r["id"]),uid),commit=True); st.rerun()
-        st.divider()
-        confirm=st.checkbox("I confirm I want to permanently delete all my scan history")
-        if st.button("Delete all history"):
-            if confirm: query("DELETE FROM resume_history WHERE user_id=?",(uid,),commit=True); st.rerun()
-            else: st.warning("Tick the confirmation box first.")
-
-elif page.startswith("👤"):
-    hero("👤 My Profile","Manage account details and password.")
-    u=query("SELECT * FROM users WHERE id=?",(uid,),one=True)
-    a,b=st.columns(2); a.metric("Name",u["name"]); b.metric("Email",u["email"])
-    c,d=st.columns(2); c.metric("Member since",u["created_at"]); d.metric("Total scans",query("SELECT COUNT(*) AS n FROM resume_history WHERE user_id=?",(uid,),one=True)["n"])
-    st.subheader("Change password")
-    old=st.text_input("Current password",type="password")
-    new=st.text_input("New password (minimum 8 characters)",type="password")
-    confirm=st.text_input("Confirm new password",type="password")
-    if st.button("Update password",type="primary"):
-        if not verify_password(old,u["password_hash"]): st.error("Current password is incorrect.")
-        elif len(new)<8: st.error("New password must be at least 8 characters.")
-        elif new!=confirm: st.error("Passwords do not match.")
-        else: query("UPDATE users SET password_hash=? WHERE id=?",(password_hash(new),uid),commit=True); st.success("Password updated.")
-    st.divider()
-    st.subheader("Danger zone")
-    sure=st.checkbox("I understand that deleting my account permanently removes all my saved scans.")
-    if st.button("Delete my account"):
-        if sure:
-            query("DELETE FROM resume_history WHERE user_id=?",(uid,),commit=True)
-            query("DELETE FROM users WHERE id=?",(uid,),commit=True)
-            logout()
-        else: st.warning("Tick the confirmation box first.")
-
+    page_history(_uid)
 else:
-    hero("🛡️ Admin Panel","Administrative overview. This panel is restricted to the configured admin email.")
-    if st.session_state.user_email.lower()!=ADMIN_EMAIL:
-        st.error("Access denied.")
-        st.stop()
-    users=query("SELECT id,name,email,created_at FROM users ORDER BY id DESC")
-    activity=query("""SELECT h.analysis_date,u.name,u.email,h.file_name,h.category,h.ats_score
-                      FROM resume_history h JOIN users u ON u.id=h.user_id
-                      ORDER BY h.id DESC LIMIT 100""")
-    udf=pd.DataFrame([dict(r) for r in users]); adf=pd.DataFrame([dict(r) for r in activity])
-    a,b,c=st.columns(3); a.metric("Registered users",len(udf)); b.metric("Total scans",query("SELECT COUNT(*) AS n FROM resume_history",one=True)["n"]); c.metric("Admin email",ADMIN_EMAIL)
-    st.subheader("Registered users")
-    if not udf.empty: st.dataframe(udf,use_container_width=True,hide_index=True)
-    else: st.info("No users.")
-    st.subheader("Latest 100 scan activities")
-    if not adf.empty: st.dataframe(adf,use_container_width=True,hide_index=True)
-    else: st.info("No scan activity yet.")
-    st.caption("Admin access is based on email address. Configure SCVA_ADMIN_EMAIL before deployment; never use this demo configuration as the only control for a public production service.")
-
-st.markdown("---")
-st.markdown("<p style='text-align:center;color:#9ca3af'>Built with ❤️ by Sufiyan · Smart CV Analyzer Pro</p>",unsafe_allow_html=True)
+    page_profile(_uid)
+footer()
