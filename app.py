@@ -356,14 +356,8 @@ def pdf_report(d):
     doc.build(story); return buf.getvalue()
 
 # ------------------------------ UI ------------------------------
-st.markdown("""<style>
-.stApp{background:#0b1020;color:#e5e7eb}.block-container{max-width:1450px;padding-top:1.2rem}
-.hero{padding:28px 32px;border-radius:20px;background:linear-gradient(120deg,#4338ca,#7c3aed,#db2777);margin-bottom:18px}
-.hero h1,.hero p{color:white!important;margin:0}.hero p{margin-top:8px}
-div[data-testid="stMetric"]{background:#111827;border:1px solid #2b3245;padding:14px;border-radius:14px}
-.card{background:#111827;border:1px solid #2b3245;border-radius:14px;padding:16px;margin:8px 0}
-.muted{color:#9ca3af}.stButton button,.stDownloadButton button{border-radius:10px;font-weight:700}
-</style>""",unsafe_allow_html=True)
+css_fix = "<style>.stApp{background:#0b1020;color:#e5e7eb}.block-container{max-width:1450px;padding-top:1.2rem}.hero{padding:28px 32px;border-radius:20px;background:linear-gradient(120deg,#4338ca,#7c3aed,#db2777);margin-bottom:18px}.hero h1,.hero p{color:white!important;margin:0}.hero p{margin-top:8px}div[data-testid='stMetric']{background:#111827;border:1px solid #2b3245;padding:14px;border-radius:14px}.card{background:#111827;border:1px solid #2b3245;border-radius:14px;padding:16px;margin:8px 0}.muted{color:#9ca3af}.stButton button,.stDownloadButton button{border-radius:10px;font-weight:700}</style>"
+st.markdown(css_fix, unsafe_allow_html=True)
 for k,v in {"logged_in":False,"user_id":None,"user_name":"","user_email":"","page":"Analyzer"}.items(): st.session_state.setdefault(k,v)
 
 def hero(title,sub):
