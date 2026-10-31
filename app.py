@@ -1,15 +1,10 @@
 """
-CV Analyser — secure Streamlit resume analysis app
-Run: python -m pip install -r requirements.txt
-     streamlit run app.py
-
-First launch: create an account from Sign Up, then log in.
-OTP: local demo OTP is shown on screen by default. Configure SMTP/Twilio
-environment variables for actual email/SMS delivery. Do not use demo OTP in production.
+CV Analyser — Streamlit resume analysis app with password-only authentication.
+Create an account once, then sign in using email/mobile and password.
+No OTP, SMS, email verification, SMTP, or Twilio integration is used.
 """
-import os, re, io, json, hmac, hashlib, secrets, sqlite3, smtplib, urllib.parse, urllib.request, base64
+import os, re, io, json, hmac, hashlib, secrets, sqlite3
 from datetime import datetime, timedelta
-from email.message import EmailMessage
 from xml.sax.saxutils import escape
 
 import streamlit as st
@@ -18,7 +13,6 @@ st.set_page_config(page_title="CV Analyser", page_icon="📄", layout="wide")
 
 DB_FILE = os.getenv("CV_DB_FILE", "cv_analyser.db")
 PBKDF2_ITERS = 310_000
-OTP_TTL_MIN = 5
 MAX_OCR_PAGES = 10
 
 INDUSTRIES = {
@@ -46,13 +40,6 @@ def init_db():
           email TEXT UNIQUE, mobile TEXT UNIQUE, password_hash TEXT NOT NULL,
           created_at TEXT NOT NULL, failed_attempts INTEGER DEFAULT 0,
           locked_until TEXT
-        );
-        CREATE TABLE IF NOT EXISTS otps(
-          id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
-          purpose TEXT NOT NULL, salt TEXT NOT NULL, code_hash TEXT NOT NULL,
-          expires_at TEXT NOT NULL, attempts INTEGER DEFAULT 0,
-          used INTEGER DEFAULT 0, created_at TEXT NOT NULL,
-          FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
         );
         CREATE TABLE IF NOT EXISTS resume_history(
           id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
@@ -102,66 +89,6 @@ def get_user(kind, value):
     if not kind: return None
     with connect() as c:
         return c.execute(f"SELECT * FROM users WHERE {kind}=?", (value,)).fetchone()
-
-def cfg(k, default=""):
-    return os.getenv(k, st.secrets.get(k, default) if hasattr(st, "secrets") else default)
-
-def send_otp(user, code):
-    message = f"Your CV Analyser verification code is {code}. It expires in {OTP_TTL_MIN} minutes. Do not share it."
-    if user["email"] and cfg("SMTP_HOST") and cfg("SMTP_USER") and cfg("SMTP_PASSWORD"):
-        msg = EmailMessage()
-        msg["Subject"] = "CV Analyser OTP"
-        msg["From"] = cfg("SMTP_FROM", cfg("SMTP_USER"))
-        msg["To"] = user["email"]
-        msg.set_content(message)
-        port = int(cfg("SMTP_PORT", "587"))
-        if port == 465:
-            with smtplib.SMTP_SSL(cfg("SMTP_HOST"), port, timeout=15) as s:
-                s.login(cfg("SMTP_USER"), cfg("SMTP_PASSWORD")); s.send_message(msg)
-        else:
-            with smtplib.SMTP(cfg("SMTP_HOST"), port, timeout=15) as s:
-                s.starttls(); s.login(cfg("SMTP_USER"), cfg("SMTP_PASSWORD")); s.send_message(msg)
-        return "email", None
-    if user["mobile"] and cfg("TWILIO_SID") and cfg("TWILIO_TOKEN") and cfg("TWILIO_FROM"):
-        sid, token = cfg("TWILIO_SID"), cfg("TWILIO_TOKEN")
-        data = urllib.parse.urlencode({"To": cfg("DEFAULT_COUNTRY_CODE", "+91")+user["mobile"],
-              "From": cfg("TWILIO_FROM"), "Body": message}).encode()
-        req = urllib.request.Request(f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json", data=data)
-        req.add_header("Authorization", "Basic "+base64.b64encode(f"{sid}:{token}".encode()).decode())
-        urllib.request.urlopen(req, timeout=15).read()
-        return "sms", None
-    if cfg("OTP_DEMO_MODE", "1").lower() not in ("1","true","yes"):
-        raise RuntimeError("OTP delivery is not configured. Set SMTP or Twilio settings.")
-    return "demo", code
-
-def issue_otp(user, purpose):
-    with connect() as c:
-        recent = c.execute("SELECT created_at FROM otps WHERE user_id=? AND created_at>=? ORDER BY id DESC",
-                           (user["id"], stamp(now()-timedelta(hours=1)))).fetchall()
-        if len(recent) >= 5: raise ValueError("OTP limit reached. Try again after one hour.")
-        if recent and (now()-datetime.strptime(recent[0]["created_at"], "%Y-%m-%d %H:%M:%S")).total_seconds() < 30:
-            raise ValueError("Please wait 30 seconds before requesting another OTP.")
-        c.execute("UPDATE otps SET used=1 WHERE user_id=? AND purpose=? AND used=0", (user["id"],purpose))
-        code, salt = f"{secrets.randbelow(1000000):06d}", secrets.token_hex(16)
-        digest = hashlib.sha256((salt+code).encode()).hexdigest()
-        c.execute("INSERT INTO otps(user_id,purpose,salt,code_hash,expires_at,created_at) VALUES(?,?,?,?,?,?)",
-                  (user["id"],purpose,salt,digest,stamp(now()+timedelta(minutes=OTP_TTL_MIN)),stamp()))
-    mode, demo = send_otp(user, code)
-    return mode, demo
-
-def verify_otp(uid, purpose, code):
-    with connect() as c:
-        row = c.execute("SELECT * FROM otps WHERE user_id=? AND purpose=? AND used=0 ORDER BY id DESC LIMIT 1",
-                        (uid,purpose)).fetchone()
-        if not row: return False, "No active OTP. Request a new one."
-        if row["expires_at"] < stamp(): 
-            c.execute("UPDATE otps SET used=1 WHERE id=?", (row["id"],)); return False, "OTP expired."
-        if row["attempts"] >= 5:
-            c.execute("UPDATE otps SET used=1 WHERE id=?", (row["id"],)); return False, "Too many attempts. Request a new OTP."
-        good = hmac.compare_digest(hashlib.sha256((row["salt"]+(code or "").strip()).encode()).hexdigest(), row["code_hash"])
-        if good: c.execute("UPDATE otps SET used=1 WHERE id=?", (row["id"],)); return True, ""
-        c.execute("UPDATE otps SET attempts=attempts+1 WHERE id=?", (row["id"],))
-        return False, f"Incorrect OTP. {4-row['attempts']} attempts left."
 
 def extract_file(upload):
     name, data = upload.name, upload.getvalue()
@@ -290,97 +217,56 @@ for k,v in {"logged_in":False,"uid":None,"user_name":"","auth":None,"result":Non
     st.session_state.setdefault(k,v)
 
 def login_ui():
-    st.markdown('<div class="hero"><h1>📄 CV Analyser</h1><p>Secure resume analysis · Skills · Job matching · PDF reports</p></div>',unsafe_allow_html=True)
-    tabs=st.tabs(["🔐 Login","📝 Sign Up","🔑 Forgot Password"])
+    st.markdown('<div class="hero"><h1>📄 CV Analyser</h1><p>Smart resume insights · Skills · Job matching · Career guidance</p></div>',unsafe_allow_html=True)
+    tabs=st.tabs(["🔐 Login", "📝 Create Account"])
     with tabs[0]:
         with st.form("login"):
-            ident=st.text_input("Email or mobile")
+            ident=st.text_input("Email or mobile number", placeholder="you@example.com / 9876543210")
             pw=st.text_input("Password",type="password")
-            go=st.form_submit_button("Continue")
+            go=st.form_submit_button("Login", type="primary", use_container_width=True)
         if go:
             kind,val=identify(ident); u=get_user(kind,val)
-            if not u: st.error("Invalid credentials.")
-            elif u["locked_until"] and u["locked_until"]>stamp(): st.error("Account temporarily locked. Try later.")
+            if not u:
+                st.error("Account not found. Create an account first.")
+            elif u["locked_until"] and u["locked_until"]>stamp():
+                st.error("Too many failed attempts. Please try again after 10 minutes.")
             elif not verify_password(pw,u["password_hash"]):
                 with connect() as c:
                     fails=u["failed_attempts"]+1
                     c.execute("UPDATE users SET failed_attempts=?, locked_until=? WHERE id=?",
                               (0 if fails>=5 else fails,stamp(now()+timedelta(minutes=10)) if fails>=5 else None,u["id"]))
-                st.error("Invalid credentials.")
+                st.error("Incorrect email/mobile or password.")
             else:
-                try:
-                    mode,demo=issue_otp(u,"login")
-                    st.session_state.auth={"uid":u["id"],"purpose":"login","mode":mode,"demo":demo}
-                    st.rerun()
-                except Exception as e: st.error(str(e))
+                with connect() as c:
+                    c.execute("UPDATE users SET failed_attempts=0,locked_until=NULL WHERE id=?",(u["id"],))
+                st.session_state.update(logged_in=True,uid=u["id"],user_name=u["name"],result=None)
+                st.rerun()
     with tabs[1]:
         with st.form("signup"):
             name=st.text_input("Full name")
-            email=st.text_input("Email (optional if mobile supplied)")
-            mobile=st.text_input("Mobile (optional if email supplied)")
-            p1=st.text_input("Password (8+ characters, letters and numbers)",type="password")
+            email=st.text_input("Email address (optional if mobile is entered)")
+            mobile=st.text_input("Mobile number (optional if email is entered)")
+            p1=st.text_input("Create password (8+ characters, letters and numbers)",type="password")
             p2=st.text_input("Confirm password",type="password")
-            go=st.form_submit_button("Create account")
+            go=st.form_submit_button("Create account", type="primary", use_container_width=True)
         if go:
             em=email.strip().lower() or None; mob=normalize_mobile(mobile) if mobile.strip() else None
-            if not name.strip(): st.error("Enter your name.")
-            elif not em and not mob: st.error("Enter email or mobile.")
-            elif em and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+",em): st.error("Invalid email.")
-            elif mobile.strip() and not mob: st.error("Invalid mobile number.")
-            elif not valid_password(p1): st.error("Password must be 8+ characters with letters and numbers.")
+            if not name.strip(): st.error("Enter your full name.")
+            elif not em and not mob: st.error("Enter an email address or mobile number.")
+            elif em and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+",em): st.error("Enter a valid email address.")
+            elif mobile.strip() and not mob: st.error("Enter a valid mobile number.")
+            elif not valid_password(p1): st.error("Password must contain at least 8 characters, including letters and numbers.")
             elif p1!=p2: st.error("Passwords do not match.")
             else:
                 try:
-                    with connect() as c: c.execute("INSERT INTO users(name,email,mobile,password_hash,created_at) VALUES(?,?,?,?,?)",(name.strip(),em,mob,hash_password(p1),stamp()))
-                    st.success("Account created. Open Login and sign in.")
-                except sqlite3.IntegrityError: st.error("Email or mobile already registered.")
-    with tabs[2]:
-        with st.form("forgot"):
-            ident=st.text_input("Registered email or mobile")
-            go=st.form_submit_button("Send reset OTP")
-        if go:
-            kind,val=identify(ident); u=get_user(kind,val)
-            if not u: st.error("Account not found.")
-            else:
-                try:
-                    mode,demo=issue_otp(u,"reset")
-                    st.session_state.auth={"uid":u["id"],"purpose":"reset","mode":mode,"demo":demo}
+                    with connect() as c:
+                        cur=c.execute("INSERT INTO users(name,email,mobile,password_hash,created_at) VALUES(?,?,?,?,?)",(name.strip(),em,mob,hash_password(p1),stamp()))
+                        uid=cur.lastrowid
+                    st.session_state.update(logged_in=True,uid=uid,user_name=name.strip(),result=None)
+                    st.success("Account created successfully. Welcome!")
                     st.rerun()
-                except Exception as e: st.error(str(e))
-
-def otp_ui():
-    a=st.session_state.auth
-    st.subheader("🔐 OTP Verification")
-    if a["mode"]=="demo": st.warning(f"Development OTP: **{a['demo']}**")
-    else: st.info("OTP sent to your registered contact.")
-    with st.form("otp_verify"):
-        code=st.text_input("6-digit OTP",max_chars=6)
-        go=st.form_submit_button("Verify OTP")
-    if go:
-        ok,msg=verify_otp(a["uid"],a["purpose"],code)
-        if not ok: st.error(msg)
-        elif a["purpose"]=="login":
-            with connect() as c:
-                u=c.execute("SELECT * FROM users WHERE id=?",(a["uid"],)).fetchone()
-                c.execute("UPDATE users SET failed_attempts=0,locked_until=NULL WHERE id=?",(a["uid"],))
-            st.session_state.update(logged_in=True,uid=u["id"],user_name=u["name"],auth=None)
-            st.rerun()
-        else:
-            st.session_state.auth={"uid":a["uid"],"purpose":"new_password"}
-            st.rerun()
-    if st.button("Back"): st.session_state.auth=None; st.rerun()
-
-def reset_password_ui():
-    with st.form("new_pw"):
-        p1=st.text_input("New password",type="password")
-        p2=st.text_input("Confirm password",type="password")
-        go=st.form_submit_button("Update password")
-    if go:
-        if not valid_password(p1): st.error("Use 8+ characters with letters and numbers.")
-        elif p1!=p2: st.error("Passwords do not match.")
-        else:
-            with connect() as c: c.execute("UPDATE users SET password_hash=?,failed_attempts=0,locked_until=NULL WHERE id=?",(hash_password(p1),st.session_state.auth["uid"]))
-            st.session_state.auth=None; st.success("Password updated. Log in now.")
+                except sqlite3.IntegrityError:
+                    st.error("This email or mobile number is already registered. Please log in.")
 
 def dashboard(a):
     c1,c2,c3,c4=st.columns(4)
@@ -482,11 +368,8 @@ def app_ui():
                 with connect() as c: c.execute("UPDATE users SET password_hash=? WHERE id=?",(hash_password(new),u["id"]))
                 st.success("Password changed.")
 
-st.markdown('<div class="hero"><h1>📄 CV Analyser</h1><p>Resume scoring · OCR · Skills analysis · Job matching · PDF reports</p></div>',unsafe_allow_html=True)
-if st.session_state.auth:
-    if st.session_state.auth["purpose"]=="new_password": reset_password_ui()
-    else: otp_ui()
-elif not st.session_state.logged_in:
+st.markdown('<div class="hero"><h1>📄 CV Analyser</h1><p>Professional resume insights · OCR · Skills analysis · Job matching · PDF reports</p></div>',unsafe_allow_html=True)
+if not st.session_state.logged_in:
     login_ui()
 else:
     app_ui()
