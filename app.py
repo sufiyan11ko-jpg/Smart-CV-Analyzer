@@ -365,4 +365,4 @@ def app_ui():
 
 st.markdown('<div class="hero"><h1>📄 CV Analyser Pro</h1><p>Resume quality review · ATS-style checks · Global career matching · PDF reports</p></div>',unsafe_allow_html=True)
 if not st.session_state.logged_in:login_ui()
-else:app_ui()
+else:app_ui() 
